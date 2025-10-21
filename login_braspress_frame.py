@@ -7,16 +7,21 @@ login_braspress_frame.py
 • Extrai Fatura, Vencimento e Valor do HTML retornado
 • Armazena cookies e logs em braspress_archives/
 • Lê CNPJs e senha de secrets/braspress_config.json
+• Atualiza cookies e debug automaticamente a cada novo dia
 """
 
 import json
 import re
+import os
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import requests
 from bs4 import BeautifulSoup
 
+# === CONFIGURAÇÕES ===
 MAIN_URL = "https://www.braspress.com/area-do-cliente/minha-conta/"
 FRAME_ORIGIN = "https://blue.braspress.com"
 
@@ -25,6 +30,34 @@ BASE_DIR = Path(__file__).resolve().parent
 ARCHIVE_DIR = BASE_DIR / "braspress_archives"
 SECRETS_PATH = BASE_DIR / "secrets" / "braspress_config.json"
 ARCHIVE_DIR.mkdir(exist_ok=True)
+
+# === Função: limpeza diária de cookies e debug ===
+def limpar_cookies_diariamente():
+    """Apaga cookies e debug uma vez por dia."""
+    last_file = ARCHIVE_DIR / ".last_refresh"
+    hoje = datetime.now().strftime("%Y-%m-%d")
+
+    # Se o arquivo de controle não existe, cria
+    if not last_file.exists():
+        last_file.write_text(hoje, encoding="utf-8")
+        return
+
+    ultima_data = last_file.read_text(encoding="utf-8").strip()
+
+    # Se mudou o dia → apaga cookies e debug
+    if ultima_data != hoje:
+        print("[Braspress] Novo dia detectado — limpando cookies e debug antigos...")
+        for arquivo in ARCHIVE_DIR.glob("*"):
+            if arquivo.name.endswith(".json") or arquivo.name.endswith(".html"):
+                try:
+                    arquivo.unlink()
+                except Exception as e:
+                    print(f"[Braspress] Falha ao remover {arquivo.name}: {e}")
+        last_file.write_text(hoje, encoding="utf-8")
+        print("[Braspress] Limpeza concluída.")
+
+# Executa limpeza diária ao iniciar o módulo
+limpar_cookies_diariamente()
 
 # === Carrega dados sigilosos ===
 if not SECRETS_PATH.exists():
@@ -49,13 +82,35 @@ COOKIES_FILES = {
     CNPJ_MVA: path_in_archives("cookies_MVA.json")
 }
 
+# === Lógica existente (inalterada) ===
 def playwright_login(cnpj_login: str):
     """Faz login no portal Braspress usando o CNPJ informado e salva cookies."""
     cookies_file = COOKIES_FILES.get(cnpj_login, path_in_archives(f"cookies_{cnpj_login}.json"))
 
     print(f"[*] Iniciando login na Braspress com CNPJ {cnpj_login}...")
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Detecta caminho correto (empacotado ou não)
+        if getattr(sys, 'frozen', False):
+            base_path = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(sys.executable).parent
+        else:
+            base_path = Path(__file__).resolve().parent
+
+        local_browser_path = base_path / "playwright" / ".local-browsers"
+        chrome_exec = None
+        for sub in local_browser_path.rglob("headless_shell.exe"):
+            chrome_exec = sub
+            break
+
+        if chrome_exec and chrome_exec.exists():
+            print(f"✅ Usando Chromium empacotado: {chrome_exec}")
+            browser = p.chromium.launch(headless=True, executable_path=str(chrome_exec))
+        else:
+            try:
+                browser = p.chromium.launch(channel="chromium", headless=True)
+            except Exception:
+                browser = p.chromium.launch(headless=True)
+
         context = browser.new_context()
         page = context.new_page()
 
@@ -96,6 +151,7 @@ def playwright_login(cnpj_login: str):
         browser.close()
         return cookies
 
+
 def extrair_tabela(html: str):
     """Extrai dados de Fatura, Vencimento e Valor do HTML retornado."""
     soup = BeautifulSoup(html, "html.parser")
@@ -105,6 +161,7 @@ def extrair_tabela(html: str):
         if len(cols) >= 3 and re.search(r"\d", cols[0]):
             dados.append((cols[0], cols[1], cols[2]))
     return dados
+
 
 def obter_faturas(cnpj_login: str):
     """Usa cookies (ou faz login) e retorna lista de (fatura, vencimento, valor)."""
@@ -120,7 +177,6 @@ def obter_faturas(cnpj_login: str):
     else:
         cookies = playwright_login(cnpj_login)
 
-    # Converter cookies para requests
     session = requests.Session()
     for c in cookies:
         if "blue.braspress.com" in c.get("domain", ""):
@@ -144,6 +200,7 @@ def obter_faturas(cnpj_login: str):
         print(f"[-] Nenhum dado encontrado — verifique {debug_file.name}")
 
     return dados
+
 
 if __name__ == "__main__":
     cnpj_teste = CNPJ_EH

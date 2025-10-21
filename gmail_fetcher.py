@@ -28,7 +28,6 @@ def getLabelID(gmail_service, label_name="XML Processado"):
 def processarEmails(gmail_service, origemNome):
     """Busca e baixa XMLs de uma conta Gmail e os processa."""
     global emailsProcessados
-
     labelID = getLabelID(gmail_service, "XML Processado")
     results = gmail_service.users().messages().list(
         userId="me",
@@ -98,7 +97,7 @@ def processarEmails(gmail_service, origemNome):
                     f.write(fileData)
 
                 # Filtros — transportadoras e CNPJs próprios
-                if any(x in filename.upper() for x in ["BRASPRESS", "DOMINIO"]):
+                if any(x in filename.upper() for x in ["DOMINIO"]):
                     try:
                         os.remove(filePath)
                     except:

@@ -4,7 +4,7 @@ import time
 import threading
 from datetime import datetime
 
-from tray_icon import run_tray  # você já possui este arquivo
+from tray_icon import run_tray  # ícone e menu
 from auth import gmailPrincipal, gmailNFE
 from gmail_fetcher import processarEmails
 from reporter import (
@@ -13,26 +13,35 @@ from reporter import (
 )
 from config import INTERVALO
 
-# Controle de execução global
-running = True
+# =========================
+# CONTROLE GLOBAL
+# =========================
+running = False        # indica se o loop principal está ativo
+stop_event = threading.Event()  # usado para parar o loop com segurança
 
+# =========================
+# LOOP PRINCIPAL
+# =========================
 def main_loop():
     global running
-    while running:
+    running = True
+    print("[Loop] Iniciando verificação automática.")
+
+    while not stop_event.is_set():
         hora_atual = datetime.now().strftime("%H:%M - %d/%m/%Y")
-        print("\nVerificando e-mails...")
+        print("\n[Loop] Verificando e-mails...")
 
         eventosProcessados.clear()
         eventosIgnorados.clear()
 
         try:
             processarEmails(gmailPrincipal, "Conta Principal")
-            print("Aguardando 10 segundos antes da próxima conta...")
+            print("[Loop] Aguardando 10 segundos antes da próxima conta...")
             time.sleep(10)
             processarEmails(gmailNFE, "Conta NFe")
         except Exception as e:
             if "[WinError 2]" not in str(e):
-                print(f"Erro: {e}")
+                print(f"[Loop] Erro: {e}")
                 escreverRelatorio(f"[{hora_atual}] Erro: {e}")
 
         # === Relatório de Resumo ===
@@ -42,7 +51,7 @@ def main_loop():
             # Processados 
             if eventosProcessados:
                 escreverRelatorio("Fornecedores processados: ")
-                print("Fornecedores Processados:")
+                print("[Loop] Fornecedores Processados:")
                 for fornecedor, conta in eventosProcessados:
                     msg = f"• {fornecedor} ({conta})"
                     if msg not in historicoEventos:
@@ -53,7 +62,7 @@ def main_loop():
             # Ignorados
             if eventosIgnorados:
                 escreverRelatorio("\nFornecedores ignorados:")
-                print("\nFornecedores ignorados:")
+                print("[Loop] Fornecedores ignorados:")
                 for fornecedor, conta in eventosIgnorados:
                     msg = f"• {fornecedor} ({conta})"
                     if msg not in historicoEventos:
@@ -64,11 +73,11 @@ def main_loop():
             resumo = f"\nResumo: {len(eventosProcessados)} processado(s) / {len(eventosIgnorados)} ignorado(s)"
             escreverRelatorio(resumo)
             print(resumo)
-            escreverRelatorio("Fim do Relatório. \n")
-            print("Fim do relatório. \n")
+            escreverRelatorio("Fim do Relatório.\n")
+            print("Fim do relatório.\n")
             consolidarRelatorioTMP()
         else:
-            hora_chave = datetime.now().strftime("%H")  # Identifica a hora atual
+            hora_chave = datetime.now().strftime("%H")
             if ultimoRelatorio.get("vazio") != hora_chave:
                 texto = f"[{hora_atual}] Nenhuma alteração realizada."
                 print(texto)
@@ -76,25 +85,53 @@ def main_loop():
                 consolidarRelatorioTMP()
                 ultimoRelatorio["vazio"] = hora_chave
 
-        print(f"Aguardando {INTERVALO/60:.0f} minutos para próxima verificação...")
-        for _ in range(int(INTERVALO)):  # para permitir saída mais suave
-            if not running:
+        # === Espera até próxima verificação ===
+        print(f"[Loop] Aguardando {INTERVALO/60:.0f} minutos para próxima verificação...")
+        for _ in range(int(INTERVALO)):
+            if stop_event.is_set():
                 break
             time.sleep(1)
-    print("Loop principal encerrado.")
+
+    running = False
+    print("[Loop] Encerrado.")
+
+
+# =========================
+# CONTROLE DE EXECUÇÃO
+# =========================
+def iniciar_verificacao():
+    """Inicia o loop principal em thread separada (chamado pelo tray)."""
+    global running
+    if not running:
+        stop_event.clear()
+        t = threading.Thread(target=main_loop, daemon=True)
+        t.start()
+        print("[Main] Loop principal iniciado.")
+    else:
+        print("[Main] Loop já está em execução.")
+
+
+def parar_verificacao():
+    """Interrompe o loop principal."""
+    global running
+    if running:
+        print("[Main] Parando loop principal...")
+        stop_event.set()
+        running = False
+    else:
+        print("[Main] Nenhum loop ativo para encerrar.")
+
 
 def on_quit():
     """Chamado quando o usuário clica em 'Sair' no tray."""
-    global running
-    running = False
-    print("Encerrando Finance Bot...")
+    parar_verificacao()
+    print("[Main] Encerrando Finance Bot...")
     time.sleep(1)
     sys.exit(0)
 
+# =========================
+# EXECUÇÃO PRINCIPAL
+# =========================
 if __name__ == "__main__":
-    # Executa o loop principal em thread separada
-    thread_main = threading.Thread(target=main_loop, daemon=True)
-    thread_main.start()
-
-    # Executa o ícone da bandeja (bloqueante)
-    run_tray(on_quit)
+    # Passa callbacks para o tray (para permitir controle)
+    run_tray(on_quit_callback=on_quit, start_callback=iniciar_verificacao)

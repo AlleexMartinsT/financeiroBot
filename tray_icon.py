@@ -1,4 +1,3 @@
-# tray_icon.py
 """
 Tray App do Finance Bot
 -----------------------
@@ -40,10 +39,11 @@ def create_icon(color: str = "blue"):
         "red": (220, 0, 0, 255)
     }
     rgb = color_map.get(color, (0, 128, 255, 255))
-    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))  # RGBA + fundo transparente
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     draw.ellipse((8, 8, 56, 56), fill=rgb)
     return image
+
 
 # =========================
 # NOTIFICAÇÕES
@@ -54,7 +54,7 @@ def notificar(titulo, mensagem):
         notification.notify(
             title=titulo,
             message=mensagem,
-            timeout=5  # segundos
+            timeout=5
         )
     except Exception as e:
         print(f"[Tray] Falha ao exibir notificação: {e}")
@@ -63,7 +63,7 @@ def notificar(titulo, mensagem):
 # =========================
 # TRAY APP
 # =========================
-def run_tray(on_quit_callback):
+def run_tray(on_quit_callback, start_callback=None):
     """
     Inicia o ícone de bandeja com menus:
       - Verificar agora
@@ -103,7 +103,15 @@ def run_tray(on_quit_callback):
             atualizar_cor("blue")
 
     def verificar_agora(icon, item):
-        threading.Thread(target=executar_verificacao, daemon=True).start()
+        """Aciona a verificação manual ou inicia o loop do main."""
+        if start_callback:
+            # Se o main.py passou um callback, inicia o loop principal
+            print("[Tray] Iniciando loop principal via callback.")
+            atualizar_cor("green")
+            threading.Thread(target=start_callback, daemon=True).start()
+        else:
+            # Caso contrário, executa verificação manual única
+            threading.Thread(target=executar_verificacao, daemon=True).start()
 
     def abrir_relatorios(icon, item):
         caminho = Path(RELATORIO_DIR).resolve()

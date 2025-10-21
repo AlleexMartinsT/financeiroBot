@@ -56,9 +56,13 @@ def processarNFE(root, filePath):
 
     parcelas = []
     
-    if cnpjDest not in [CNPJ_EH, CNPJ_MVA]:
-        print(f"NF {nfNum} ignorada — nota de saída ({filePath})")
+    if cnpjDest in [CNPJ_EH, CNPJ_MVA]:
+        print(f"NF {nfNum} ignorada — destinatário é a própria empresa ({cnpjDest})")
         registrarEvento("ignorado", fornecedor, "Conta Principal")
+        try:
+            os.remove(filePath)
+        except:
+            pass
         return
     
     for dup in duplicatas:
@@ -150,6 +154,7 @@ def processarNFE(root, filePath):
         
 # === Processar CT-e ===
 def processarCTE(root, filePath):
+    
     from braspress_utils import buscarBraspressFaturas  # import local para evitar dependência circular
     from reporter import escreverRelatorio
 
@@ -166,6 +171,15 @@ def processarCTE(root, filePath):
     valorTotal = float(total.text) if total is not None else 0.0
     cnpjDest = dest.find('cte:CNPJ', ns).text if dest is not None else ""
 
+    if cnpjDest in [CNPJ_EH, CNPJ_MVA]:
+        print(f"NF {nfNum} ignorada — destinatário é a própria empresa ({cnpjDest})")
+        registrarEvento("ignorado", fornecedor, "Conta Principal")
+        try:
+            os.remove(filePath)
+        except:
+            pass
+        return
+    
     # === BRASPRESS ===
     if "BRASPRESS" in fornecedorUpper:
         print(f"[Braspress] Detectado CT-e {nfNum} - buscando vencimento automático...")

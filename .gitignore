@@ -3,4 +3,10 @@ relatorios/
 xmls_baixados/
 braspress_archives/
 secrets/
+build/
+dist/
+build_script.py
+*.spec
+*.iss
+Output/
 __pycache__
