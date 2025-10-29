@@ -56,14 +56,18 @@ def processarNFE(root, filePath):
 
     parcelas = []
     
-    if cnpjDest in [CNPJ_EH, CNPJ_MVA]:
-        print(f"NF {nfNum} ignorada — destinatário é a própria empresa ({cnpjDest})")
+    cnpjEmit = emit.find('nfe:CNPJ', ns).text if emit is not None else ""
+
+    # Ignorar apenas se a empresa for a emitente (nota própria)
+    if cnpjEmit in [CNPJ_EH, CNPJ_MVA]:
+        print(f"NF {nfNum} ignorada — emitente é a própria empresa ({cnpjEmit})")
         registrarEvento("ignorado", fornecedor, "Conta Principal")
         try:
             os.remove(filePath)
         except:
             pass
         return
+
     
     for dup in duplicatas:
         vencimento = dup.find('nfe:dVenc', ns).text if dup.find('nfe:dVenc', ns) is not None else "-"
@@ -140,7 +144,12 @@ def processarNFE(root, filePath):
         
         for _ in range(3):
             try:
-                aba.append_row(novaLinha, value_input_option="USER_ENTERED")
+                # Descobre a primeira linha realmente vazia
+                dados_existentes = aba.get_all_values()
+                linha_vazia = len(dados_existentes) + 1
+                # Preenche toda a linha explicitamente (colunas A até I)
+                cell_range = f"A{linha_vazia}:I{linha_vazia}"
+                aba.update(cell_range, [novaLinha], value_input_option="USER_ENTERED")
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -148,6 +157,7 @@ def processarNFE(root, filePath):
                     continue
                 else:
                     raise e
+
                        
         print(f"Inserido: {empresa} {ano} | {nomeAba} | Parcela {i}/{qtdParcelas} - {fornecedor} - {num}")
         registrarEvento("processado", fornecedor, "Conta Principal")
@@ -170,9 +180,12 @@ def processarCTE(root, filePath):
     nfNum = ide.find('cte:nCT', ns).text if ide is not None else "-"
     valorTotal = float(total.text) if total is not None else 0.0
     cnpjDest = dest.find('cte:CNPJ', ns).text if dest is not None else ""
+    cnpjEmit = emit.find('nfe:CNPJ', ns).text if emit is not None else ""
 
-    if cnpjDest in [CNPJ_EH, CNPJ_MVA]:
-        print(f"NF {nfNum} ignorada — destinatário é a própria empresa ({cnpjDest})")
+    # Ignorar apenas se a empresa for a emitente (nota própria)
+    if cnpjEmit in [CNPJ_EH, CNPJ_MVA]:
+        print(cnpjEmit)
+        print(f"NF {nfNum} ignorada — emitente é a própria empresa ({cnpjEmit})")
         registrarEvento("ignorado", fornecedor, "Conta Principal")
         try:
             os.remove(filePath)
