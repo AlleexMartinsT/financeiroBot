@@ -11,6 +11,14 @@ from sheets_utils import escolherPlanilha
 from reporter import registrarEvento
 from auth import apiCooldown
 
+from decimal import Decimal, InvalidOperation
+
+# abreviações de mês em PT (para criar aba no formato "Nov/2025")
+MES_ABREV_PT = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
+
+def nome_aba_pt(dt):
+    return f"{MES_ABREV_PT[dt.month-1]}/{dt.year}"
+
 # === Extrair fornecedor do XML ===
 def extrairFornecedor(file_path):
     try:
@@ -88,7 +96,8 @@ def processarNFE(root, filePath):
             print(f"CNPJ {cnpjDest} não corresponde a nenhuma planilha ({filePath})")
             continue
 
-        nomeAba = dataVencimento.strftime("%b/%Y").capitalize()
+        nomeAba = nome_aba_pt(dataVencimento)
+
         try:
             for _ in range(3):
                 try:
@@ -165,10 +174,10 @@ def processarNFE(root, filePath):
 # === Processar CT-e ===
 def processarCTE(root, filePath):
     
-    from braspress_utils import buscarBraspressFaturas  # import local para evitar dependência circular
+    from braspress_utils import buscarBraspressFaturas, inserir_fatura_braspress  # import local para evitar dependência circular
     from reporter import escreverRelatorio
 
-    ns = {'cte': 'http://www.portalfiscal.inf.br/cte'}
+    ns = {'cte': 'http://www.portalfiscal.inf.br/cte','nfe': 'http://www.portalfiscal.inf.br/nfe'}
     emit = root.find('.//cte:emit', ns)
     dest = root.find('.//cte:dest', ns)
     ide = root.find('.//cte:ide', ns)
@@ -180,7 +189,7 @@ def processarCTE(root, filePath):
     nfNum = ide.find('cte:nCT', ns).text if ide is not None else "-"
     valorTotal = float(total.text) if total is not None else 0.0
     cnpjDest = dest.find('cte:CNPJ', ns).text if dest is not None else ""
-    cnpjEmit = emit.find('nfe:CNPJ', ns).text if emit is not None else ""
+    cnpjEmit = emit.find('cte:CNPJ', ns).text if emit is not None else ""
 
     # Ignorar apenas se a empresa for a emitente (nota própria)
     if cnpjEmit in [CNPJ_EH, CNPJ_MVA]:
@@ -197,6 +206,13 @@ def processarCTE(root, filePath):
     if "BRASPRESS" in fornecedorUpper:
         print(f"[Braspress] Detectado CT-e {nfNum} - buscando vencimento automático...")
         faturas = buscarBraspressFaturas(cnpjDest)
+
+        # Insere todas as faturas encontradas (a função deve checar duplicatas internamente)
+        for item in faturas:
+            # item["valor"] pode ser Decimal ou float/str — deixar a função lidar com isso é OK,
+            # mas aqui passamos cnpjDest (antes você usava 'cnpj' indefinido)
+            inserir_fatura_braspress(cnpjDest, item["fatura"], item["vencimento"], item["valor"])
+
         if not faturas:
             print(f"[Braspress] Nenhuma fatura obtida para {cnpjDest}, pulando {filePath}")
             registrarEvento("ignorado", fornecedor, "Conta NFe")
@@ -206,9 +222,42 @@ def processarCTE(root, filePath):
                 pass
             return
 
-        from decimal import Decimal
-        valDec = Decimal(str(round(valorTotal, 2)))
-        correspondentes = [f for f in faturas if abs(f["valor"] - valDec) < Decimal("0.05")]
+        # comparar valores com Decimal (mais robusto que float)
+        try:
+            # valorTotal pode vir como float — converta de forma segura para Decimal
+            if isinstance(valorTotal, Decimal):
+                valDec = valorTotal.quantize(Decimal("0.01"))
+            else:
+                valDec = Decimal(str(round(float(valorTotal), 2))).quantize(Decimal("0.01"))
+        except (InvalidOperation, ValueError):
+            valDec = Decimal("0.00")
+
+        correspondentes = []
+        for f in faturas:
+            try:
+                f_val = f["valor"]
+                f_val_dec = f_val if isinstance(f_val, Decimal) else Decimal(str(f_val))
+                if abs(f_val_dec - valDec) < Decimal("0.05"):
+                    correspondentes.append(f)
+            except Exception:
+                continue
+
+        if not correspondentes:
+            print(f"[Braspress] Nenhuma fatura com valor correspondente ({valorTotal}).")
+            registrarEvento("ignorado", fornecedor, "Conta NFe")
+            try:
+                os.remove(filePath)
+            except:
+                pass
+            return
+
+        if len(correspondentes) > 1:
+            msg = f"[Braspress] Aviso: múltiplas faturas com mesmo valor ({valorTotal}) para {cnpjDest}."
+            print(msg)
+            escreverRelatorio(msg)
+
+        vencimento = correspondentes[0]["vencimento"]
+        print(f"[Braspress] Valor {valorTotal} → vencimento {vencimento}")
 
         if not correspondentes:
             print(f"[Braspress] Nenhuma fatura com valor correspondente ({valorTotal}).")
@@ -269,7 +318,7 @@ def processarCTE(root, filePath):
             pass
         return
 
-    nomeAba = dataVencimento.strftime("%b/%Y").capitalize()
+    nomeAba = nome_aba_pt(dataVencimento)
     try:
         aba = planilha.worksheet(nomeAba)
     except gspread.exceptions.WorksheetNotFound:

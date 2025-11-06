@@ -16,6 +16,7 @@ from config import INTERVALO
 # =========================
 # CONTROLE GLOBAL
 # =========================
+
 running = False        # indica se o loop principal está ativo
 stop_event = threading.Event()  # usado para parar o loop com segurança
 
