@@ -143,10 +143,10 @@ def processarNFE(root, filePath):
             dataVencimento.strftime("%d/%m/%Y"),
             fornecedor,
             num,
-            f"R$ {valorTotal:,.2f}",
+            f"{valorTotal:.2f}".replace(".", ","),
             qtdParcelas,
             f"{i}ª Parcela",
-            f"R$ {valor:,.2f}",
+            f"{valor:.2f}".replace(".", ","), 
             "",
             ""
         ]
@@ -343,10 +343,10 @@ def processarCTE(root, filePath):
         dataVencimento.strftime("%d/%m/%Y"),
         fornecedor,
         nfNum,
-        f"R$ {valorTotal:,.2f}",
+        f"{valorTotal:.2f}".replace(".", ","),
         1,
         "1ª Parcela",
-        f"R$ {valorTotal:,.2f}",
+        f"{valorTotal:.2f}".replace(".", ","),
         "",
         ""
     ]
