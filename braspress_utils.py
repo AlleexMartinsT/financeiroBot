@@ -5,7 +5,7 @@ from datetime import datetime
 from sheets_utils import escolherPlanilha
 import gspread
 
-# Utilitário para normalizar valor (ex: "R$ 1.234,56" -> Decimal("1234.56"))
+# UtilitÃ¡rio para normalizar valor (ex: "R$ 1.234,56" -> Decimal("1234.56"))
 def normalizarValor(valor_str):
     if not valor_str:
         return Decimal("0")
@@ -22,7 +22,7 @@ def buscarBraspressFaturas(cnpj):
     """
     print(f"[Braspress] Efetuando busca de faturas para CNPJ {cnpj} ...")
 
-    # Usa a função obter_faturas do login_braspress_frame.py
+    # Usa a funÃ§Ã£o obter_faturas do login_braspress_frame.py
     try:
         listaBruta = obter_faturas(cnpj)
     except Exception as e:
@@ -44,15 +44,18 @@ def buscarBraspressFaturas(cnpj):
 
     return faturas
 
-# mapeamento de meses em PT (abreviação usada no seu histórico: "Nov/2025")
+# mapeamento de meses em PT (abreviaÃ§Ã£o usada no seu histÃ³rico: "Nov/2025")
 MES_ABREV_PT = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
 
 def _mes_aba_pt(dt: datetime) -> str:
     return f"{MES_ABREV_PT[dt.month-1]}/{dt.year}"
 
+def _texto_parcela(indice: int) -> str:
+    return f"{indice}\u00aa Parcela"
+
 def _parse_vencimento(venc_str: str) -> datetime:
     """
-    Aceita 'dd/mm/YYYY' ou 'dd/mm/YY' ou outras variações simples.
+    Aceita 'dd/mm/YYYY' ou 'dd/mm/YY' ou outras variaÃ§Ãµes simples.
     Se falhar, usa hoje.
     """
     if not venc_str:
@@ -62,7 +65,7 @@ def _parse_vencimento(venc_str: str) -> datetime:
             return datetime.strptime(venc_str.strip(), fmt)
         except Exception:
             pass
-    # fallback — tenta extrair números
+    # fallback â€” tenta extrair nÃºmeros
     partes = [p for p in re.split(r"[^\d]", venc_str) if p]
     if len(partes) >= 3:
         try:
@@ -79,14 +82,13 @@ def inserir_fatura_braspress(cnpj_dest: str, fatura: str, vencimento: str, valor
     """
     from reporter import registrarEvento
     from auth import apiCooldown
-    from decimal import Decimal
 
     # Determinar ano e planilha
     data_venc = _parse_vencimento(vencimento)
     ano = data_venc.year
     planilha, empresa = escolherPlanilha(cnpj_dest, ano)
     if not planilha:
-        print(f"[Braspress] Não foi possível escolher planilha para {cnpj_dest} ({ano}).")
+        print(f"[Braspress] NÃ£o foi possÃ­vel escolher planilha para {cnpj_dest} ({ano}).")
         return False
 
     nome_aba = _mes_aba_pt(data_venc)
@@ -95,8 +97,14 @@ def inserir_fatura_braspress(cnpj_dest: str, fatura: str, vencimento: str, valor
     try:
         aba = planilha.worksheet(nome_aba)
     except gspread.exceptions.WorksheetNotFound:
-        aba = planilha.add_worksheet(title=nome_aba, rows="100", cols="9")
-        aba.append_row(["Vencimento", "Descrição", "CT-e", "Valor Total", "Qtd Parcelas", "Parcela", "Valor Parcela", "Valor Pago", "Status"])
+        try:
+            aba = planilha.add_worksheet(title=nome_aba, rows="100", cols="9")
+            aba.append_row(["Vencimento", "DescriÃ§Ã£o", "CT-e", "Valor Total", "Qtd Parcelas", "Parcela", "Valor Parcela", "Valor Pago", "Status"])
+        except gspread.exceptions.APIError as e:
+            if "already exists" in str(e).lower():
+                aba = planilha.worksheet(nome_aba)
+            else:
+                raise e
 
     # Ler dados existentes
     for _ in range(3):
@@ -119,19 +127,19 @@ def inserir_fatura_braspress(cnpj_dest: str, fatura: str, vencimento: str, valor
         for linha in dados if len(linha) >= 3
     )
     if duplicado:
-        print(f"[Braspress] Fatura {fatura} ({data_venc.strftime('%d/%m/%Y')}) já existe em {empresa} {ano} / {nome_aba}")
+        print(f"[Braspress] Fatura {fatura} ({data_venc.strftime('%d/%m/%Y')}) jÃ¡ existe em {empresa} {ano} / {nome_aba}")
         return False
 
-    # Monta a nova linha no padrão do processor.py
+    # Monta a nova linha no padrÃ£o do processor.py
     valor_fmt = f"R$ {float(valor):,.2f}"
     fornecedor = "BRASPRESS TRANSPORTES URGENTES LTDA (Bot)"
     nova_linha = [
         data_venc.strftime("%d/%m/%Y"),  # Vencimento
-        fornecedor,                      # Descrição / Fornecedor
-        fatura,                          # CT-e (ou nº fatura)
+        fornecedor,                      # DescriÃ§Ã£o / Fornecedor
+        fatura,                          # CT-e (ou nÂº fatura)
         valor_fmt,                       # Valor Total
         1,                               # Qtd Parcelas
-        "1ª Parcela",                    # Parcela
+        _texto_parcela(1),               # Parcela
         valor_fmt,                       # Valor Parcela
         "",                              # Valor Pago
         ""                               # Status
@@ -140,8 +148,7 @@ def inserir_fatura_braspress(cnpj_dest: str, fatura: str, vencimento: str, valor
     # Inserir linha no final (respeitando USER_ENTERED)
     for _ in range(3):
         try:
-            dados_existentes = aba.get_all_values()
-            linha_vazia = len(dados_existentes) + 1
+            linha_vazia = len(dados) + 1
             cell_range = f"A{linha_vazia}:I{linha_vazia}"
             aba.update(cell_range, [nova_linha], value_input_option="USER_ENTERED")
             break

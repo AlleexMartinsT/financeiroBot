@@ -1,23 +1,34 @@
-# processor.py
 import os
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 import gspread
 
 from config import CNPJ_EH, CNPJ_MVA
 from sheets_utils import escolherPlanilha
-from reporter import registrarEvento
+from reporter import registrarEvento, registrarAviso, escreverRelatorio
 from auth import apiCooldown
 
-from decimal import Decimal, InvalidOperation
 
-# abreviações de mês em PT (para criar aba no formato "Nov/2025")
-MES_ABREV_PT = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
+MES_ABREV_PT = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+
 
 def nome_aba_pt(dt):
-    return f"{MES_ABREV_PT[dt.month-1]}/{dt.year}"
+    return f"{MES_ABREV_PT[dt.month - 1]}/{dt.year}"
+
+
+def _doc_ref(prefixo, numero, file_path):
+    arq = os.path.basename(file_path)
+    if numero and numero != "-":
+        return f"{prefixo} {numero} ({arq})"
+    return f"{prefixo} ({arq})"
+
+
+def _texto_parcela(indice):
+    return f"{indice}\u00aa Parcela"
+
 
 # === Extrair fornecedor do XML ===
 def extrairFornecedor(file_path):
@@ -25,19 +36,18 @@ def extrairFornecedor(file_path):
         tree = ET.parse(file_path)
         root = tree.getroot()
         ns = {
-            'nfe': 'http://www.portalfiscal.inf.br/nfe',
-            'cte': 'http://www.portalfiscal.inf.br/cte'
+            "nfe": "http://www.portalfiscal.inf.br/nfe",
+            "cte": "http://www.portalfiscal.inf.br/cte",
         }
 
-        # Busca o emitente de forma segura
-        emit = root.find('.//nfe:emit', ns)
+        emit = root.find(".//nfe:emit", ns)
         if emit is None:
-            emit = root.find('.//cte:emit', ns)
+            emit = root.find(".//cte:emit", ns)
 
         if emit is not None:
-            nome = emit.find('nfe:xNome', ns)
+            nome = emit.find("nfe:xNome", ns)
             if nome is None:
-                nome = emit.find('cte:xNome', ns)
+                nome = emit.find("cte:xNome", ns)
 
             if nome is not None and nome.text:
                 return nome.text.strip().upper()
@@ -47,53 +57,63 @@ def extrairFornecedor(file_path):
     except Exception:
         return "DESCONHECIDO"
 
+
 # === Processar NF-e ===
 def processarNFE(root, filePath):
-    ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-    emit = root.find('.//nfe:emit', ns)
-    dest = root.find('.//nfe:dest', ns)
-    ide = root.find('.//nfe:ide', ns)
-    total = root.find('.//nfe:ICMSTot', ns)
-    duplicatas = root.findall('.//nfe:cobr/nfe:dup', ns)
+    inseriu_alguma = False
+    ns = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
+    emit = root.find(".//nfe:emit", ns)
+    dest = root.find(".//nfe:dest", ns)
+    ide = root.find(".//nfe:ide", ns)
+    total = root.find(".//nfe:ICMSTot", ns)
+    duplicatas = root.findall(".//nfe:cobr/nfe:dup", ns)
 
-    fornecedor = emit.find('nfe:xNome', ns).text if emit is not None else "-"
+    fornecedor = emit.find("nfe:xNome", ns).text if emit is not None and emit.find("nfe:xNome", ns) is not None else "-"
     fornecedor = f"{fornecedor} (Bot)"
-    nfNum = ide.find('nfe:nNF', ns).text if ide is not None else "-"
-    valorTotal = float(total.find('nfe:vNF', ns).text) if total is not None else 0.0
-    cnpjDest = dest.find('nfe:CNPJ', ns).text if dest is not None else ""
+    nfNum = ide.find("nfe:nNF", ns).text if ide is not None and ide.find("nfe:nNF", ns) is not None else "-"
+    valorTotal = float(total.find("nfe:vNF", ns).text) if total is not None and total.find("nfe:vNF", ns) is not None else 0.0
+    cnpjDest = dest.find("nfe:CNPJ", ns).text if dest is not None and dest.find("nfe:CNPJ", ns) is not None else ""
+    cnpjEmit = emit.find("nfe:CNPJ", ns).text if emit is not None and emit.find("nfe:CNPJ", ns) is not None else ""
 
-    parcelas = []
-    
-    cnpjEmit = emit.find('nfe:CNPJ', ns).text if emit is not None else ""
-
-    # Ignorar apenas se a empresa for a emitente (nota própria)
     if cnpjEmit in [CNPJ_EH, CNPJ_MVA]:
-        print(f"NF {nfNum} ignorada — emitente é a própria empresa ({cnpjEmit})")
+        print(f"NF {nfNum} ignorada: emitente e a propria empresa ({cnpjEmit})")
         registrarEvento("ignorado", fornecedor, "Conta Principal")
         try:
             os.remove(filePath)
-        except:
+        except Exception:
             pass
-        return
+        return False
 
-    
+    parcelas = []
     for dup in duplicatas:
-        vencimento = dup.find('nfe:dVenc', ns).text if dup.find('nfe:dVenc', ns) is not None else "-"
-        valor = float(dup.find('nfe:vDup', ns).text) if dup.find('nfe:vDup', ns) is not None else 0.0
+        vencimento = dup.find("nfe:dVenc", ns).text if dup.find("nfe:dVenc", ns) is not None else "-"
+        valor = float(dup.find("nfe:vDup", ns).text) if dup.find("nfe:vDup", ns) is not None else 0.0
         parcelas.append((nfNum, vencimento, valor))
-        
-    qtdParcelas = len(parcelas) 
+
+    if not parcelas:
+        aviso = f"{_doc_ref('NF', nfNum, filePath)} sem duplicatas/vencimento no XML; nota nao lancada"
+        print(aviso)
+        registrarAviso(aviso, "Conta Principal")
+        registrarEvento("ignorado", fornecedor, "Conta Principal")
+        return False
+
+    qtdParcelas = len(parcelas)
 
     for i, (num, vencimento, valor) in enumerate(parcelas, start=1):
         try:
             dataVencimento = datetime.strptime(vencimento, "%Y-%m-%d")
-        except:
+        except Exception:
+            aviso = f"{_doc_ref('NF', num, filePath)} com vencimento invalido '{vencimento}'; parcela ignorada"
+            print(aviso)
+            registrarAviso(aviso, "Conta Principal")
             continue
 
         ano = dataVencimento.year
         planilha, empresa = escolherPlanilha(cnpjDest, ano)
         if not planilha:
-            print(f"CNPJ {cnpjDest} não corresponde a nenhuma planilha ({filePath})")
+            aviso = f"{_doc_ref('NF', num, filePath)} sem planilha para CNPJ destino {cnpjDest} ({ano})"
+            print(aviso)
+            registrarAviso(aviso, "Conta Principal")
             continue
 
         nomeAba = nome_aba_pt(dataVencimento)
@@ -107,14 +127,21 @@ def processarNFE(root, filePath):
                     if "429" in str(e):
                         apiCooldown()
                         continue
-                    else:
-                        raise e
+                    raise
             else:
-                print(f"Não foi possível acessar a aba {nomeAba} após múltiplas tentativas.")
-                return
+                aviso = f"{_doc_ref('NF', num, filePath)}: falha ao acessar aba {nomeAba}"
+                print(aviso)
+                registrarAviso(aviso, "Conta Principal")
+                return False
         except gspread.exceptions.WorksheetNotFound:
-            aba = planilha.add_worksheet(title=nomeAba, rows="100", cols="9")
-            aba.append_row(["Vencimento", "Descrição", "NF", "Valor Total", "Qtd Parcelas", "Parcela", "Valor Parcela", "Valor Pago", "Status"])
+            try:
+                aba = planilha.add_worksheet(title=nomeAba, rows="100", cols="9")
+                aba.append_row(["Vencimento", "Descricao", "NF", "Valor Total", "Qtd Parcelas", "Parcela", "Valor Parcela", "Valor Pago", "Status"])
+            except gspread.exceptions.APIError as e:
+                if "already exists" in str(e).lower():
+                    aba = planilha.worksheet(nomeAba)
+                else:
+                    raise
 
         for _ in range(3):
             try:
@@ -124,19 +151,26 @@ def processarNFE(root, filePath):
                 if "429" in str(e):
                     apiCooldown()
                     continue
-                else:
-                    raise e
+                raise
         else:
-            print("Falha ao obter dados da aba após múltiplas tentativas.")
-            return
+            aviso = f"{_doc_ref('NF', num, filePath)}: falha ao ler dados da aba {nomeAba}"
+            print(aviso)
+            registrarAviso(aviso, "Conta Principal")
+            return False
 
-        dadosValidos = [linha for linha in dados if len(linha) >= 3 and linha[0] and linha[2] and "Vencimento" not in linha[0]]
+        dadosValidos = [
+            linha
+            for linha in dados
+            if len(linha) >= 3 and linha[0] and linha[2] and "Vencimento" not in linha[0]
+        ]
         duplicado = any(
             num == linha[2].strip() and dataVencimento.strftime("%d/%m/%Y") == linha[0].strip()
             for linha in dadosValidos
         )
         if duplicado:
-            print(f"NF {num} ({dataVencimento.strftime('%d/%m/%Y')}) já existe em {empresa} {ano} / {nomeAba}")
+            aviso = f"{_doc_ref('NF', num, filePath)} ja lancada em {empresa} {ano}/{nomeAba} ({dataVencimento.strftime('%d/%m/%Y')})"
+            print(aviso)
+            registrarAviso(aviso, "Conta Principal")
             continue
 
         novaLinha = [
@@ -145,86 +179,80 @@ def processarNFE(root, filePath):
             num,
             f"{valorTotal:.2f}".replace(".", ","),
             qtdParcelas,
-            f"{i}ª Parcela",
-            f"{valor:.2f}".replace(".", ","), 
+            _texto_parcela(i),
+            f"{valor:.2f}".replace(".", ","),
             "",
-            ""
+            "",
         ]
-        
+
         for _ in range(3):
             try:
-                # Descobre a primeira linha realmente vazia
-                dados_existentes = aba.get_all_values()
-                linha_vazia = len(dados_existentes) + 1
-                # Preenche toda a linha explicitamente (colunas A até I)
+                linha_vazia = len(dados) + 1
                 cell_range = f"A{linha_vazia}:I{linha_vazia}"
                 aba.update(cell_range, [novaLinha], value_input_option="USER_ENTERED")
+                dados.append(novaLinha)
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
                     apiCooldown()
                     continue
-                else:
-                    raise e
+                raise
 
-                       
         print(f"Inserido: {empresa} {ano} | {nomeAba} | Parcela {i}/{qtdParcelas} - {fornecedor} - {num}")
         registrarEvento("processado", fornecedor, "Conta Principal")
-        
+        inseriu_alguma = True
+
+    return inseriu_alguma
+
+
 # === Processar CT-e ===
 def processarCTE(root, filePath):
-    
-    from braspress_utils import buscarBraspressFaturas, inserir_fatura_braspress  # import local para evitar dependência circular
-    from reporter import escreverRelatorio
+    from braspress_utils import buscarBraspressFaturas, inserir_fatura_braspress
 
-    ns = {'cte': 'http://www.portalfiscal.inf.br/cte','nfe': 'http://www.portalfiscal.inf.br/nfe'}
-    emit = root.find('.//cte:emit', ns)
-    dest = root.find('.//cte:dest', ns)
-    ide = root.find('.//cte:ide', ns)
-    total = root.find('.//cte:vPrest/cte:vTPrest', ns)
-    entrega = root.find('.//cte:compl/cte:Entrega/cte:comData/cte:dProg', ns)
+    inseriu_alguma = False
+    ns = {"cte": "http://www.portalfiscal.inf.br/cte", "nfe": "http://www.portalfiscal.inf.br/nfe"}
+    emit = root.find(".//cte:emit", ns)
+    dest = root.find(".//cte:dest", ns)
+    ide = root.find(".//cte:ide", ns)
+    total = root.find(".//cte:vPrest/cte:vTPrest", ns)
+    entrega = root.find(".//cte:compl/cte:Entrega/cte:comData/cte:dProg", ns)
 
-    fornecedor = emit.find('cte:xNome', ns).text if emit is not None else "-"
+    fornecedor = emit.find("cte:xNome", ns).text if emit is not None and emit.find("cte:xNome", ns) is not None else "-"
     fornecedorUpper = fornecedor.upper() if fornecedor else "-"
-    nfNum = ide.find('cte:nCT', ns).text if ide is not None else "-"
-    valorTotal = float(total.text) if total is not None else 0.0
-    cnpjDest = dest.find('cte:CNPJ', ns).text if dest is not None else ""
-    cnpjEmit = emit.find('cte:CNPJ', ns).text if emit is not None else ""
+    nfNum = ide.find("cte:nCT", ns).text if ide is not None and ide.find("cte:nCT", ns) is not None else "-"
+    valorTotal = float(total.text) if total is not None and total.text else 0.0
+    cnpjDest = dest.find("cte:CNPJ", ns).text if dest is not None and dest.find("cte:CNPJ", ns) is not None else ""
+    cnpjEmit = emit.find("cte:CNPJ", ns).text if emit is not None and emit.find("cte:CNPJ", ns) is not None else ""
 
-    # Ignorar apenas se a empresa for a emitente (nota própria)
     if cnpjEmit in [CNPJ_EH, CNPJ_MVA]:
-        print(cnpjEmit)
-        print(f"NF {nfNum} ignorada — emitente é a própria empresa ({cnpjEmit})")
+        print(f"CT-e {nfNum} ignorado: emitente e a propria empresa ({cnpjEmit})")
         registrarEvento("ignorado", fornecedor, "Conta Principal")
         try:
             os.remove(filePath)
-        except:
+        except Exception:
             pass
-        return
-    
-    # === BRASPRESS ===
+        return inseriu_alguma
+
     if "BRASPRESS" in fornecedorUpper:
-        print(f"[Braspress] Detectado CT-e {nfNum} - buscando vencimento automático...")
+        print(f"[Braspress] Detectado CT-e {nfNum} - buscando vencimento automatico...")
         faturas = buscarBraspressFaturas(cnpjDest)
 
-        # Insere todas as faturas encontradas (a função deve checar duplicatas internamente)
         for item in faturas:
-            # item["valor"] pode ser Decimal ou float/str — deixar a função lidar com isso é OK,
-            # mas aqui passamos cnpjDest (antes você usava 'cnpj' indefinido)
-            inserir_fatura_braspress(cnpjDest, item["fatura"], item["vencimento"], item["valor"])
+            if inserir_fatura_braspress(cnpjDest, item["fatura"], item["vencimento"], item["valor"]):
+                inseriu_alguma = True
 
         if not faturas:
-            print(f"[Braspress] Nenhuma fatura obtida para {cnpjDest}, pulando {filePath}")
+            aviso = f"{_doc_ref('CT-e', nfNum, filePath)} Braspress sem faturas para CNPJ {cnpjDest}; nota nao lancada"
+            print(aviso)
+            registrarAviso(aviso, "Conta NFe")
             registrarEvento("ignorado", fornecedor, "Conta NFe")
             try:
                 os.remove(filePath)
-            except:
+            except Exception:
                 pass
-            return
+            return inseriu_alguma
 
-        # comparar valores com Decimal (mais robusto que float)
         try:
-            # valorTotal pode vir como float — converta de forma segura para Decimal
             if isinstance(valorTotal, Decimal):
                 valDec = valorTotal.quantize(Decimal("0.01"))
             else:
@@ -243,101 +271,103 @@ def processarCTE(root, filePath):
                 continue
 
         if not correspondentes:
-            print(f"[Braspress] Nenhuma fatura com valor correspondente ({valorTotal}).")
+            aviso = f"{_doc_ref('CT-e', nfNum, filePath)} Braspress sem fatura com valor correspondente ({valorTotal})"
+            print(aviso)
+            registrarAviso(aviso, "Conta NFe")
             registrarEvento("ignorado", fornecedor, "Conta NFe")
             try:
                 os.remove(filePath)
-            except:
+            except Exception:
                 pass
-            return
+            return inseriu_alguma
 
         if len(correspondentes) > 1:
-            msg = f"[Braspress] Aviso: múltiplas faturas com mesmo valor ({valorTotal}) para {cnpjDest}."
+            msg = f"{_doc_ref('CT-e', nfNum, filePath)} Braspress com multiplas faturas no mesmo valor ({valorTotal})"
             print(msg)
             escreverRelatorio(msg)
+            registrarAviso(msg, "Conta NFe")
 
         vencimento = correspondentes[0]["vencimento"]
-        print(f"[Braspress] Valor {valorTotal} → vencimento {vencimento}")
-
-        if not correspondentes:
-            print(f"[Braspress] Nenhuma fatura com valor correspondente ({valorTotal}).")
-            registrarEvento("ignorado", fornecedor, "Conta NFe")
-            try:
-                os.remove(filePath)
-            except:
-                pass
-            return
-
-        if len(correspondentes) > 1:
-            msg = f"[Braspress] Aviso: múltiplas faturas com mesmo valor ({valorTotal}) para {cnpjDest}."
-            print(msg)
-            escreverRelatorio(msg)
-
-        vencimento = correspondentes[0]["vencimento"]
-        print(f"[Braspress] Valor {valorTotal} → vencimento {vencimento}")
-
+        nfNum = correspondentes[0]["fatura"]
+        print(f"[Braspress] Valor {valorTotal} -> vencimento {vencimento}")
     else:
-        # CT-e normal
         if any(x in fornecedorUpper for x in ["DOMINIO"]):
             print(f"Ignorado CT-e de transportadora ({filePath})")
             try:
                 os.remove(filePath)
-            except:
+            except Exception:
                 pass
-            return
+            return inseriu_alguma
 
         vencimento = entrega.text if entrega is not None else None
 
     fornecedor = f"{fornecedor} (Bot)"
     if not vencimento:
-        print(f"CT-e {nfNum} sem data de vencimento, pulando.")
+        aviso = f"{_doc_ref('CT-e', nfNum, filePath)} sem data de vencimento; nota nao lancada"
+        print(aviso)
+        registrarAviso(aviso, "Conta NFe")
         try:
             os.remove(filePath)
-        except:
+        except Exception:
             pass
-        return
+        return inseriu_alguma
 
-    # === Continua igual ao original abaixo ===
     try:
         dataVencimento = datetime.strptime(vencimento, "%Y-%m-%d")
     except ValueError:
         try:
             dataVencimento = datetime.strptime(vencimento, "%d/%m/%Y")
-        except:
-            print(f"Data inválida {vencimento} em {filePath}")
-            os.remove(filePath)
-            return
+        except Exception:
+            aviso = f"{_doc_ref('CT-e', nfNum, filePath)} com data invalida '{vencimento}'; nota nao lancada"
+            print(aviso)
+            registrarAviso(aviso, "Conta NFe")
+            try:
+                os.remove(filePath)
+            except Exception:
+                pass
+            return inseriu_alguma
 
     ano = dataVencimento.year
     planilha, empresa = escolherPlanilha(cnpjDest, ano)
     if not planilha:
-        print(f"CNPJ {cnpjDest} não corresponde a nenhuma planilha ({filePath})")
+        aviso = f"{_doc_ref('CT-e', nfNum, filePath)} sem planilha para CNPJ destino {cnpjDest} ({ano})"
+        print(aviso)
+        registrarAviso(aviso, "Conta NFe")
         try:
             os.remove(filePath)
-        except:
+        except Exception:
             pass
-        return
+        return inseriu_alguma
 
     nomeAba = nome_aba_pt(dataVencimento)
     try:
         aba = planilha.worksheet(nomeAba)
     except gspread.exceptions.WorksheetNotFound:
-        aba = planilha.add_worksheet(title=nomeAba, rows="100", cols="9")
-        aba.append_row(["Vencimento", "Descrição", "CT-e", "Valor Total", "Qtd Parcelas", "Parcela", "Valor Parcela", "Valor Pago", "Status"])
+        try:
+            aba = planilha.add_worksheet(title=nomeAba, rows="100", cols="9")
+            aba.append_row(["Vencimento", "Descricao", "CT-e", "Valor Total", "Qtd Parcelas", "Parcela", "Valor Parcela", "Valor Pago", "Status"])
+        except gspread.exceptions.APIError as e:
+            if "already exists" in str(e).lower():
+                aba = planilha.worksheet(nomeAba)
+            else:
+                raise
 
     dados = aba.get_all_values()
     duplicado = any(
         nfNum == linha[2].strip() and dataVencimento.strftime("%d/%m/%Y") == linha[0].strip()
-        for linha in dados if len(linha) >= 3
+        for linha in dados
+        if len(linha) >= 3
     )
 
     if duplicado:
-        print(f"CT-e {nfNum} ({dataVencimento.strftime('%d/%m/%Y')}) já existe em {empresa} {ano} / {nomeAba}")
+        aviso = f"{_doc_ref('CT-e', nfNum, filePath)} ja lancado em {empresa} {ano}/{nomeAba} ({dataVencimento.strftime('%d/%m/%Y')})"
+        print(aviso)
+        registrarAviso(aviso, "Conta NFe")
         try:
             os.remove(filePath)
-        except:
+        except Exception:
             pass
-        return
+        return inseriu_alguma
 
     novaLinha = [
         dataVencimento.strftime("%d/%m/%Y"),
@@ -345,31 +375,44 @@ def processarCTE(root, filePath):
         nfNum,
         f"{valorTotal:.2f}".replace(".", ","),
         1,
-        "1ª Parcela",
+        _texto_parcela(1),
         f"{valorTotal:.2f}".replace(".", ","),
         "",
-        ""
+        "",
     ]
-    
+
     aba.append_row(novaLinha, value_input_option="USER_ENTERED")
     print(f"Inserido: {empresa} {ano} | {nomeAba} | Parcela 1/1 - {fornecedor} - {nfNum}")
     registrarEvento("processado", fornecedor, "Conta NFe")
+    inseriu_alguma = True
 
     try:
         os.remove(filePath)
         print(f"XML removido: {filePath}")
-    except:
+    except Exception:
         pass
     time.sleep(1.0)
+    return inseriu_alguma
+
 
 # === Decide tipo do XML ===
 def processarXML(filePath):
-    tree = ET.parse(filePath)
-    root = tree.getroot()
+    try:
+        tree = ET.parse(filePath)
+        root = tree.getroot()
+    except Exception as e:
+        aviso = f"XML invalido ({os.path.basename(filePath)}): {e}"
+        print(aviso)
+        registrarAviso(aviso, "Conta Principal")
+        return False
+
     tag = root.tag.lower()
     if tag.endswith("nfeproc"):
-        processarNFE(root, filePath)
+        return processarNFE(root, filePath)
     elif tag.endswith("cteproc"):
-        processarCTE(root, filePath)
+        return processarCTE(root, filePath)
     else:
-        print(f"Tipo de XML desconhecido ({filePath})")
+        aviso = f"Tipo de XML desconhecido ({os.path.basename(filePath)}); nao processado"
+        print(aviso)
+        registrarAviso(aviso, "Conta Principal")
+        return False
