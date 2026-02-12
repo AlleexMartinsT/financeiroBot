@@ -112,8 +112,8 @@ def _password_errors(password: str, username: str) -> list[str]:
     pwd = str(password or "")
     user = _normalize_username(username)
     errs = []
-    if len(pwd) < 10:
-        errs.append("A senha deve ter no mínimo 10 caracteres")
+    if len(pwd) < 6:
+        errs.append("A senha deve ter no mínimo 6 caracteres")
     if not re.search(r"[a-z]", pwd):
         errs.append("A senha deve ter ao menos uma letra minúscula")
     if not re.search(r"[A-Z]", pwd):
@@ -1439,7 +1439,7 @@ pre{margin:6px 0 0;background:#fff7ef;border:1px dashed #cf9f78;padding:8px;bord
 <label class="cb"><input id="unread" type="checkbox" checked/><span>Marcar como não lido</span></label>
 <div class="btns stack"><button onclick="reprocess()">Remover labels para reprocessar</button><button id="runNowBtn" class="sec" onclick="runNow()">Executar agora</button><button id="stopNowBtn" class="sec stop-btn-locked" onclick="stopRunNow()" disabled>Parar</button></div></section>
 <section class="card cfg-sec-card"><h3>Configurações</h3><div class="sec-grid">
-<div class="sec-box"><h4>Reiniciar senha</h4><div class="sec-row"><div><label>Senha atual</label><input id="pwdCurr" type="password" autocomplete="current-password"/></div><div><label>Nova senha</label><input id="pwdNew" type="password" autocomplete="new-password"/></div><ul class="pwd-reqs"><li id="reqLen">* Mínimo 10 caracteres</li><li id="reqLower">* Pelo menos uma letra minúscula</li><li id="reqUpper">* Pelo menos uma letra maiúscula</li><li id="reqDigit">* Pelo menos um número</li><li id="reqSpec">* Pelo menos um caractere especial</li></ul><div><label>Confirmar nova senha</label><input id="pwdNew2" type="password" autocomplete="new-password"/></div><div class="sec-actions"><button class="sec" onclick="changeOwnPassword()">Atualizar minha senha</button></div><div class="mini-note">Os requisitos ficam verdes conforme a senha atende cada regra</div></div></div>
+<div class="sec-box"><h4>Reiniciar senha</h4><div class="sec-row"><div><label>Senha atual</label><input id="pwdCurr" type="password" autocomplete="current-password"/></div><div><label>Nova senha</label><input id="pwdNew" type="password" autocomplete="new-password"/></div><ul class="pwd-reqs"><li id="reqLen">* Mínimo 6 caracteres</li><li id="reqLower">* Pelo menos uma letra minúscula</li><li id="reqUpper">* Pelo menos uma letra maiúscula</li><li id="reqDigit">* Pelo menos um número</li><li id="reqSpec">* Pelo menos um caractere especial</li></ul><div><label>Confirmar nova senha</label><input id="pwdNew2" type="password" autocomplete="new-password"/></div><div class="sec-actions"><button class="sec" onclick="changeOwnPassword()">Atualizar minha senha</button></div><div class="mini-note">Os requisitos ficam verdes conforme a senha atende cada regra</div></div></div>
 <div id="adminArea" class="sec-box admin-only"><h4>Administração de usuários</h4><div id="userTags" class="user-tags"></div><div class="exp-tabs">
 <section class="exp-tab"><button type="button" class="exp-toggle" aria-expanded="false">Criar novo usuário</button><div class="exp-body"><div class="sec-row"><div><label>Novo usuário</label><input id="newUser" type="text" placeholder="usuario.exemplo"/></div><div><label>Senha do novo usuário</label><input id="newUserPwd" type="password" autocomplete="new-password"/></div><div><label>Confirmar senha</label><input id="newUserPwd2" type="password" autocomplete="new-password"/></div><div><label>Perfil</label><select id="newUserRole"><option value="user">Usuário</option><option value="admin">Admin</option></select></div><div class="sec-actions"><button onclick="adminCreateUser()">Criar usuário</button></div><div><label>Remover usuário</label><select id="delUser"></select></div><div class="sec-actions"><button class="sec" onclick="adminDeleteUser()">Remover usuário</button></div></div></div></section>
 <section class="exp-tab"><button type="button" class="exp-toggle" aria-expanded="false">Redefinir senha (qualquer usuário)</button><div class="exp-body"><div class="sec-row"><div><label>Usuário</label><select id="rstUser"></select></div><div><label>Nova senha</label><input id="rstPwd" type="password" autocomplete="new-password"/></div><div><label>Confirmar nova senha</label><input id="rstPwd2" type="password" autocomplete="new-password"/></div><div class="sec-actions"><button class="sec" onclick="adminResetPassword()">Redefinir senha</button></div></div></div></section>
@@ -1511,7 +1511,7 @@ function _clearPwdFieldErrors(){['pwdCurr','pwdNew','pwdNew2'].forEach(id=>_mark
 function _pwdRules(pwd){
   const p=String(pwd||'');
   return {
-    len:p.length>=10,
+    len:p.length>=6,
     low:/[a-z]/.test(p),
     up:/[A-Z]/.test(p),
     dig:/\\d/.test(p),
