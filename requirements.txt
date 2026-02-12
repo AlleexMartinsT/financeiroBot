@@ -3,6 +3,9 @@ google-auth
 google-auth-oauthlib
 gspread
 playwright
+greenlet
+requests
+beautifulsoup4
 pystray
 pillow
 plyer

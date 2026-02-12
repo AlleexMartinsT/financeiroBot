@@ -33,7 +33,10 @@ if (!(Test-Path $pythonExe)) {
 
 Write-Host "[Deploy] Instalando dependencias..."
 & $pythonExe -m pip install --upgrade pip
+& $pythonExe -m pip install --upgrade setuptools wheel
 & $pythonExe -m pip install -r (Join-Path $TargetDir "requirements.txt")
+& $pythonExe -m pip install --force-reinstall --no-cache-dir greenlet playwright
+& $pythonExe -m playwright install chromium
 
 Write-Host "[Deploy] Iniciando FinanceBot em modo servidor..."
 Start-Process -FilePath $pythonExe -WorkingDirectory $TargetDir -ArgumentList "main.py --server --no-browser"
