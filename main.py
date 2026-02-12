@@ -105,7 +105,7 @@ def _check_and_restart_if_update():
 def main_loop():
     global running
     running = True
-    print("[Loop] Iniciando verificaÃ§Ã£o automatica.")
+    print("[Loop] Iniciando verificação automatica.")
     limpar_xmls_baixados()
     runtime_status.set_account_status("principal", "waiting", "Aguardando ciclo.")
     runtime_status.set_account_status("nfe", "waiting", "Aguardando ciclo.")
