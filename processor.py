@@ -231,8 +231,6 @@ def processarNFE(root, filePath):
 
 # === Processar CT-e ===
 def processarCTE(root, filePath):
-    from braspress_utils import buscarBraspressFaturas, inserir_fatura_braspress
-
     inseriu_alguma = False
     ns = {"cte": "http://www.portalfiscal.inf.br/cte", "nfe": "http://www.portalfiscal.inf.br/nfe"}
     emit = root.find(".//cte:emit", ns)
@@ -258,6 +256,22 @@ def processarCTE(root, filePath):
         return inseriu_alguma
 
     if "BRASPRESS" in fornecedorUpper:
+        try:
+            from braspress_utils import buscarBraspressFaturas, inserir_fatura_braspress
+        except Exception as e:
+            aviso = (
+                f"{_doc_ref('CT-e', nfNum, filePath)} Braspress sem dependencias de runtime "
+                f"(playwright/bs4/greenlet): {e}"
+            )
+            print(aviso)
+            registrarAviso(aviso, "Conta NFe")
+            registrarEvento("ignorado", fornecedor, "Conta NFe")
+            try:
+                os.remove(filePath)
+            except Exception:
+                pass
+            return inseriu_alguma
+
         print(f"[Braspress] Detectado CT-e {nfNum} - buscando vencimento automatico...")
         faturas = buscarBraspressFaturas(cnpjDest)
 
