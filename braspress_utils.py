@@ -4,6 +4,7 @@ from login_braspress_frame import obter_faturas
 from datetime import datetime
 from sheets_utils import escolherPlanilha
 import gspread
+from history_store import log_boleto_lancado
 
 # UtilitÃ¡rio para normalizar valor (ex: "R$ 1.234,56" -> Decimal("1234.56"))
 def normalizarValor(valor_str):
@@ -161,4 +162,27 @@ def inserir_fatura_braspress(cnpj_dest: str, fatura: str, vencimento: str, valor
 
     print(f"Inserido: {empresa} {ano} | {nome_aba} | Parcela 1/1 - {fornecedor} - {fatura}")
     registrarEvento("processado", fornecedor, "Conta NFe")
+    try:
+        log_boleto_lancado(
+            {
+                "conta": "Conta NFe",
+                "doc_tipo": "CT-e Braspress",
+                "numero": str(fatura),
+                "fornecedor": fornecedor,
+                "cnpj_emit": "",
+                "cnpj_dest": cnpj_dest,
+                "vencimento": data_venc.strftime("%d/%m/%Y"),
+                "valor_total": f"{float(valor):.2f}",
+                "valor_parcela": f"{float(valor):.2f}",
+                "parcela": _texto_parcela(1),
+                "qtd_parcelas": 1,
+                "empresa": empresa,
+                "ano": int(ano),
+                "aba": nome_aba,
+                "arquivo_xml": "",
+                "local_lancamento": f"{empresa} {ano}/{nome_aba}",
+            }
+        )
+    except Exception:
+        pass
     return True

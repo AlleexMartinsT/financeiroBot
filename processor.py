@@ -10,6 +10,7 @@ from config import CNPJ_EH, CNPJ_MVA
 from sheets_utils import escolherPlanilha
 from reporter import registrarEvento, registrarAviso, escreverRelatorio
 from auth import apiCooldown
+from history_store import log_boleto_lancado
 
 
 MES_ABREV_PT = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
@@ -168,7 +169,7 @@ def processarNFE(root, filePath):
             for linha in dadosValidos
         )
         if duplicado:
-            aviso = f"{_doc_ref('NF', num, filePath)} ja lancada em {empresa} {ano}/{nomeAba} ({dataVencimento.strftime('%d/%m/%Y')})"
+            aviso = f"{_doc_ref('NF', num, filePath)} já lançada em {empresa} {nomeAba} ({dataVencimento.strftime('%d/%m/%Y')})"
             print(aviso)
             registrarAviso(aviso, "Conta Principal")
             continue
@@ -200,6 +201,29 @@ def processarNFE(root, filePath):
 
         print(f"Inserido: {empresa} {ano} | {nomeAba} | Parcela {i}/{qtdParcelas} - {fornecedor} - {num}")
         registrarEvento("processado", fornecedor, "Conta Principal")
+        try:
+            log_boleto_lancado(
+                {
+                    "conta": "Conta Principal",
+                    "doc_tipo": "NF",
+                    "numero": str(num),
+                    "fornecedor": fornecedor,
+                    "cnpj_emit": cnpjEmit,
+                    "cnpj_dest": cnpjDest,
+                    "vencimento": dataVencimento.strftime("%d/%m/%Y"),
+                    "valor_total": f"{valorTotal:.2f}",
+                    "valor_parcela": f"{valor:.2f}",
+                    "parcela": _texto_parcela(i),
+                    "qtd_parcelas": int(qtdParcelas),
+                    "empresa": empresa,
+                    "ano": int(ano),
+                    "aba": nomeAba,
+                    "arquivo_xml": os.path.basename(filePath),
+                    "local_lancamento": f"{empresa} {ano}/{nomeAba}",
+                }
+            )
+        except Exception:
+            pass
         inseriu_alguma = True
 
     return inseriu_alguma
@@ -360,7 +384,7 @@ def processarCTE(root, filePath):
     )
 
     if duplicado:
-        aviso = f"{_doc_ref('CT-e', nfNum, filePath)} ja lancado em {empresa} {ano}/{nomeAba} ({dataVencimento.strftime('%d/%m/%Y')})"
+        aviso = f"{_doc_ref('CT-e', nfNum, filePath)} já lançado em {empresa} {nomeAba} ({dataVencimento.strftime('%d/%m/%Y')})"
         print(aviso)
         registrarAviso(aviso, "Conta NFe")
         try:
@@ -384,6 +408,29 @@ def processarCTE(root, filePath):
     aba.append_row(novaLinha, value_input_option="USER_ENTERED")
     print(f"Inserido: {empresa} {ano} | {nomeAba} | Parcela 1/1 - {fornecedor} - {nfNum}")
     registrarEvento("processado", fornecedor, "Conta NFe")
+    try:
+        log_boleto_lancado(
+            {
+                "conta": "Conta NFe",
+                "doc_tipo": "CT-e",
+                "numero": str(nfNum),
+                "fornecedor": fornecedor,
+                "cnpj_emit": cnpjEmit,
+                "cnpj_dest": cnpjDest,
+                "vencimento": dataVencimento.strftime("%d/%m/%Y"),
+                "valor_total": f"{valorTotal:.2f}",
+                "valor_parcela": f"{valorTotal:.2f}",
+                "parcela": _texto_parcela(1),
+                "qtd_parcelas": 1,
+                "empresa": empresa,
+                "ano": int(ano),
+                "aba": nomeAba,
+                "arquivo_xml": os.path.basename(filePath),
+                "local_lancamento": f"{empresa} {ano}/{nomeAba}",
+            }
+        )
+    except Exception:
+        pass
     inseriu_alguma = True
 
     try:

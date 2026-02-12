@@ -6,25 +6,40 @@ from datetime import datetime, timedelta
 from config import DOWNLOAD_DIR
 from processor import processarXML, extrairFornecedor
 from reporter import limparRelatoriosAntigos
+from settings_manager import load_settings
+from history_store import log_email_processado
 
-# Janela de busca de e-mails:
-# - "last_30_days": hoje ate 30 dias atras
-# - "current_and_previous_month": mes atual + mes anterior
-FILTRO_PERIODO_EMAILS = "last_30_days"
-
-
-def _query_periodo():
+def _query_periodo(filtro_periodo_emails):
     base = (
         'has:attachment filename:xml in:inbox -in:sent -in:drafts '
         '-label:"XML Processado" -label:"XML Analisado"'
     )
     hoje = datetime.now().date()
 
-    if FILTRO_PERIODO_EMAILS == "current_and_previous_month":
+    if filtro_periodo_emails == "current_and_previous_month":
         primeiro_dia_mes_atual = hoje.replace(day=1)
         ultimo_dia_mes_anterior = primeiro_dia_mes_atual - timedelta(days=1)
         primeiro_dia_mes_anterior = ultimo_dia_mes_anterior.replace(day=1)
         after = primeiro_dia_mes_anterior.strftime("%Y/%m/%d")
+        before = (hoje + timedelta(days=1)).strftime("%Y/%m/%d")
+    elif filtro_periodo_emails == "previous_month":
+        primeiro_dia_mes_atual = hoje.replace(day=1)
+        ultimo_dia_mes_anterior = primeiro_dia_mes_atual - timedelta(days=1)
+        primeiro_dia_mes_anterior = ultimo_dia_mes_anterior.replace(day=1)
+        after = primeiro_dia_mes_anterior.strftime("%Y/%m/%d")
+        before = primeiro_dia_mes_atual.strftime("%Y/%m/%d")
+    elif filtro_periodo_emails == "current_week":
+        inicio_semana = hoje - timedelta(days=hoje.weekday())  # segunda-feira
+        after = inicio_semana.strftime("%Y/%m/%d")
+        before = (hoje + timedelta(days=1)).strftime("%Y/%m/%d")
+    elif filtro_periodo_emails == "last_15_days":
+        after = (hoje - timedelta(days=15)).strftime("%Y/%m/%d")
+        before = (hoje + timedelta(days=1)).strftime("%Y/%m/%d")
+    elif filtro_periodo_emails == "last_45_days":
+        after = (hoje - timedelta(days=45)).strftime("%Y/%m/%d")
+        before = (hoje + timedelta(days=1)).strftime("%Y/%m/%d")
+    elif filtro_periodo_emails == "last_60_days":
+        after = (hoje - timedelta(days=60)).strftime("%Y/%m/%d")
         before = (hoje + timedelta(days=1)).strftime("%Y/%m/%d")
     else:
         after = (hoje - timedelta(days=30)).strftime("%Y/%m/%d")
@@ -47,18 +62,22 @@ def getLabelID(gmail_service, label_name):
     return novoLabel["id"]
 
 
-def processarEmails(gmail_service, origemNome):
+def processarEmails(gmail_service, origemNome, stop_event=None):
     """Busca e baixa XMLs de uma conta Gmail e os processa."""
     label_processado = getLabelID(gmail_service, "XML Processado")
     label_analisado = getLabelID(gmail_service, "XML Analisado")
 
-    query = _query_periodo()
-    max_paginas = 3
-    page_size = 50
+    cfg = load_settings()
+    query = _query_periodo(cfg.get("gmail_filter_mode", "last_30_days"))
+    max_paginas = int(cfg.get("gmail_max_pages", 3))
+    page_size = int(cfg.get("gmail_page_size", 50))
 
     mensagens_brutas = []
     next_page_token = None
     for _ in range(max_paginas):
+        if stop_event and stop_event.is_set():
+            print(f"({origemNome}) Leitura manual interrompida antes de concluir as paginas.")
+            break
         req = gmail_service.users().messages().list(
             userId="me",
             q=query,
@@ -84,7 +103,11 @@ def processarEmails(gmail_service, origemNome):
     emailsSemXML = 0
     xmlsProcessadosTOTAL = 0
 
+    interrompido = False
     for msg in messages:
+        if stop_event and stop_event.is_set():
+            interrompido = True
+            break
         msgID = msg["id"]
 
         try:
@@ -99,6 +122,21 @@ def processarEmails(gmail_service, origemNome):
             print(f"({origemNome}) Erro ao acessar e-mail: {e}")
             continue
 
+        payload = message.get("payload", {})
+        headers = payload.get("headers", []) if isinstance(payload, dict) else []
+        subject = ""
+        for h in headers:
+            if str(h.get("name", "")).lower() == "subject":
+                subject = str(h.get("value", ""))
+                break
+        data_email = ""
+        try:
+            internal_ms = int(message.get("internalDate", "0"))
+            if internal_ms > 0:
+                data_email = datetime.fromtimestamp(internal_ms / 1000).isoformat()
+        except Exception:
+            data_email = ""
+
         def buscarPartes(partes):
             encontrados = []
             for p in partes:
@@ -110,6 +148,7 @@ def processarEmails(gmail_service, origemNome):
 
         parts = message.get("payload", {}).get("parts", [])
         anexosXML = buscarPartes(parts)
+        xml_names = [p.get("filename", "") for p in anexosXML if p.get("filename")]
 
         if not anexosXML:
             emailsSemXML += 1
@@ -119,6 +158,9 @@ def processarEmails(gmail_service, origemNome):
         tentou_analisar = False
 
         for part in anexosXML:
+            if stop_event and stop_event.is_set():
+                interrompido = True
+                break
             filename = part.get("filename")
             attachID = part["body"].get("attachmentId")
 
@@ -190,13 +232,31 @@ def processarEmails(gmail_service, origemNome):
                     "addLabelIds": add_labels,
                 },
             ).execute()
+            try:
+                log_email_processado(
+                    conta=origemNome,
+                    msg_id=msgID,
+                    subject=subject,
+                    data_email=data_email,
+                    xml_total=len(anexosXML),
+                    xml_lancados=xmlsInseridos,
+                    xml_arquivos=xml_names,
+                )
+            except Exception:
+                pass
         else:
             emailsSemXML += 1
+
+        if interrompido:
+            break
 
     if xmlsProcessadosTOTAL > 0:
         print(f"({origemNome}) {xmlsProcessadosTOTAL} XML(s) processado(s).")
     elif emailsSemXML < len(messages):
         print(f"({origemNome}) Nenhum XML valido processado.")
 
-    print(f"({origemNome}) Verificacao finalizada.\n")
+    if interrompido:
+        print(f"({origemNome}) Verificacao interrompida manualmente.\n")
+    else:
+        print(f"({origemNome}) Verificacao finalizada.\n")
     limparRelatoriosAntigos()

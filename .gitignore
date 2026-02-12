@@ -1,12 +1,29 @@
-*.json
+# Python cache/virtual env
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Local runtime/generated data
 relatorios/
 xmls_baixados/
 braspress_archives/
+Output/
+
+# Secrets and local credentials
 secrets/
+*.json
+!README.json.example
+
+# Build and packaging outputs
 build/
 dist/
-build_script.py
-*.spec
-*.iss
-Output/
-__pycache__
+*.egg-info/
+*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

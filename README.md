@@ -1,54 +1,34 @@
-﻿# Finance Bot
+# FinanceBot
 
-Finance Bot automates the processing of XML invoices from Gmail and writes payable entries to Google Sheets.
+FinanceBot automates XML invoice processing from Gmail and posts payable entries to Google Sheets.
 
-## What It Does
+## Core Features
 
-- Connects to two Gmail accounts ("Conta Principal" and "Conta NFe").
-- Finds invoice XML attachments (`NF-e` and `CT-e`).
-- Parses suppliers, values, due dates, and installments.
-- Writes entries to the correct company/year worksheet.
-- Creates monthly tabs automatically (for example: `Feb/2026`).
-- Prevents duplicate launches by invoice number + due date.
-- Handles Braspress-specific CT-e logic and invoice matching.
-- Generates daily reports with:
-  - processed suppliers,
-  - ignored suppliers,
-  - warning list with daily occurrence counts.
+- Reads two Gmail accounts (`principal` and `nfe`)
+- Downloads and processes `NF-e` and `CT-e` XML attachments
+- Avoids duplicate launches in Sheets
+- Handles Braspress-specific logic
+- Generates daily reporting and warnings
+- Exposes a web control panel with role-based access (`dev`, `admin`, `user`)
+- Supports server mode and optional auto-update from Git
 
-## Recent Improvements
+## Repository Layout
 
-- Automatic startup: the verification loop now starts without clicking "start" in the tray.
-- Gmail optimization:
-  - period-based query (default: last 30 days),
-  - pagination,
-  - avoids reprocessing by using `XML Processado` and `XML Analisado` labels.
-- Google Sheets optimization:
-  - reduced redundant reads before writes,
-  - better worksheet creation race handling (`already exists`).
-- Report reliability:
-  - fixed daily `.tmp` report consolidation.
-- Startup/cycle hygiene:
-  - cleans stale files in `xmls_baixados` before each verification cycle.
+- Runtime modules: project root (`main.py`, `panel_web.py`, `processor.py`, etc.)
+- Scripts: `scripts/`
+- Packaging: `packaging/`
+- Branding assets: `assets/branding/`
+- Technical docs: `docs/`
 
-## Project Structure
-
-- `main.py`: application loop, scheduler, tray integration.
-- `gmail_fetcher.py`: Gmail search/download flow.
-- `processor.py`: XML parsing and Google Sheets insertion.
-- `braspress_utils.py`: Braspress retrieval/insert helpers.
-- `reporter.py`: daily report and warnings aggregation.
-- `auth.py`: Gmail and Sheets authentication.
-- `config.py`: private config loading and constants.
+See `docs/REPOSITORY_STRUCTURE.md` for details.
 
 ## Requirements
 
 - Python 3.11+
-- Google API credentials for Gmail and Sheets
-- Service account access to target spreadsheets
-- Optional: Playwright dependencies for Braspress login flow
+- Gmail + Google Sheets credentials
+- Access to target spreadsheets
 
-## Required Files
+## Required Secrets
 
 Create these files under `secrets/`:
 
@@ -58,28 +38,59 @@ Create these files under `secrets/`:
 - `credentials_gmailNFE.json`
 - `braspress_config.json` (if Braspress flow is enabled)
 
-## Basic Run
+## Run (Local)
 
 ```bash
 python main.py
 ```
 
-The app starts the verification loop automatically and also opens the tray icon menu.
+## Run (Server mode, no tray)
 
-## Gmail Labels Used
+```bash
+python main.py --server --no-browser
+```
 
-- `XML Processado`: email had at least one XML successfully inserted into Sheets.
-- `XML Analisado`: email was analyzed and should not be scanned again.
+Windows shortcut:
 
-## Time Window for Email Scan
+```bat
+run_server.bat
+```
 
-In `gmail_fetcher.py`:
+## Deploy from Git (Windows)
 
-- `FILTRO_PERIODO_EMAILS = "last_30_days"` (default)
-- `FILTRO_PERIODO_EMAILS = "current_and_previous_month"`
+```powershell
+.\deploy_server.ps1 -RepoUrl "https://github.com/<org>/<repo>.git" -Branch "main" -TargetDir "C:\FinanceBot"
+```
 
-## Notes
+## Build EXE
 
-- Year selection is based on XML due date, not email receive date.
-- Duplicate prevention is enforced at worksheet level.
-- Daily reports are written in `relatorios/`.
+Compatibility command:
+
+```bash
+python build_script.py
+```
+
+Direct script:
+
+```bash
+python scripts/build_release.py
+```
+
+## Packaging Files
+
+- PyInstaller spec: `packaging/FinanceBot.spec`
+- Inno Setup script: `packaging/FinanceBot.iss`
+
+## Git Workflow
+
+Branch model and contribution process:
+
+- `docs/GIT_WORKFLOW.md`
+- `docs/COMMIT_PLAN.md`
+- `docs/RELEASE_CHECKLIST.md`
+
+## Important Notes
+
+- No secrets should be committed
+- Runtime-generated folders are ignored by Git
+- Auto-update requires an actual Git clone on the target machine

@@ -20,6 +20,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 import requests
 from bs4 import BeautifulSoup
+from config import BRASPRESS_ARCHIVE_DIR, BRASPRESS_CONFIG_PATH
 
 # === CONFIGURAÇÕES ===
 MAIN_URL = "https://www.braspress.com/area-do-cliente/minha-conta/"
