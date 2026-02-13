@@ -195,9 +195,7 @@ def _ensure_auth_store() -> dict:
             return out
 
     default_user = "dev"
-    default_pass = secrets.token_urlsafe(9).replace("-", "").replace("_", "")
-    if len(default_pass) < 10:
-        default_pass = (default_pass + "Senha1234")[:10]
+    default_pass = "dev"
     salt_hex = secrets.token_hex(16)
     data = {
         "users": [
