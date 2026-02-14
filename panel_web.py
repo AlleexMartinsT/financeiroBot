@@ -1501,7 +1501,17 @@ const _PATH_RESERVED=new Set(['','login','logout','api','assets','static','store
 function _basePrefix(){const p=String(window.location.pathname||'/');const segs=p.split('/').filter(Boolean);if(!segs.length)return '';const first=String(segs[0]||'').toLowerCase();if(_PATH_RESERVED.has(first))return '';return `/${segs[0]}`;}
 const _BASE_PREFIX=_basePrefix();
 function _url(path){const p=String(path||'');if(!p.startsWith('/'))return p;if(!_BASE_PREFIX)return p;return p.startsWith(`${_BASE_PREFIX}/`)||p===_BASE_PREFIX?p:`${_BASE_PREFIX}${p}`;}
-function goHub(){window.location.href='/';}
+function goHub(){
+  try{
+    const ref=document.referrer?new URL(document.referrer):null;
+    if(ref&&ref.origin&&ref.origin!==window.location.origin){
+      window.location.assign(ref.origin+'/');
+      return;
+    }
+  }catch(_){}
+  const target=new URL('/',window.location.origin).toString();
+  window.location.assign(target);
+}
 function initHubBackButton(){const b=document.getElementById('backHubBtn');if(!b)return;if(_BASE_PREFIX)b.classList.remove('hidden');else b.classList.add('hidden');}
 async function api(url,opts){const r=await fetch(_url(url),opts);const j=await r.json().catch(()=>({}));if(r.status===401){window.location.href=_url('/login');throw new Error('nao autenticado');}return {r,j};}
 async function logout(){await fetch(_url('/api/logout'),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(()=>{});window.location.href=_url('/login');}
