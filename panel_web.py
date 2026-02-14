@@ -1288,6 +1288,7 @@ def _render_html() -> str:
 .whoami{font-size:.82rem;opacity:.95}
 .logout-btn{padding:7px 10px;border:1px solid rgba(255,244,234,.5);border-radius:8px;background:rgba(255,244,234,.12);color:#fff9f3;font-weight:700;cursor:pointer}
 .logout-btn:hover{background:rgba(255,244,234,.2)}
+.hub-back-btn{margin-right:8px}
 .tabs{display:flex;gap:8px;padding:10px 10px 0}
 .tab-btn{padding:8px 12px;border-radius:9px;border:1px solid #d7b393;background:#fff5ea;color:#5a311b;font-weight:700;cursor:pointer}
 .tab-btn.active{background:linear-gradient(90deg,var(--o),var(--o2));color:#2b1408;border-color:#ca894f}
@@ -1410,7 +1411,7 @@ pre{margin:6px 0 0;background:#fff7ef;border:1px dashed #cf9f78;padding:8px;bord
 </style></head><body>
 <div id="ov" class="ov"><div class="ovb"><h4>Reautenticação em andamento</h4><p>Troque para a conta correta no navegador<br/>A autenticação começará em:</p><div id="cnt" class="cnt">5</div></div></div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
-<main class="app"><div class="top"><span>FinanceBot - Painel de Controle MVA</span><div class="top-right"><span id="whoami" class="whoami">Usuário: -</span><button class="logout-btn" onclick="logout()">Sair</button></div></div>
+<main class="app"><div class="top"><span>FinanceBot - Painel de Controle MVA</span><div class="top-right"><span id="whoami" class="whoami">Usuário: -</span><button id="backHubBtn" class="logout-btn hub-back-btn hidden" onclick="goHub()">Voltar ao HUB</button><button class="logout-btn" onclick="logout()">Sair</button></div></div>
 <div class="tabs"><button id="tabBtnMain" class="tab-btn active" onclick="switchTab('main')">Painel</button><button id="tabBtnHist" class="tab-btn" onclick="switchTab('hist')">Histórico</button><button id="tabBtnReg" class="tab-btn hidden" onclick="switchTab('reg')">Registro</button><button id="tabBtnDiag" class="tab-btn" onclick="switchTab('diag')">Diagnóstico</button></div>
 <div id="tabMain" class="c tab-panel">
 <section class="card"><h3>Status das contas de e-mail</h3><div class="status">
@@ -1496,8 +1497,14 @@ const fill=(id,arr)=>{const ul=document.getElementById(id);ul.innerHTML='';const
 const maskXml=(txt)=>{let s=String(txt||'');s=s.replace(/(\\d{8,})(-(?:nfe|cte))?\\.xml/gi,(_,d,suf)=>`***${d.slice(-8)}${suf||''}.xml`);s=s.replace(/\\b(\\d{44})\\b/g,(_,d)=>`***${d.slice(-8)}`);return s;};
 let _toastTimer=null;
 function showToast(msg){const t=document.getElementById('toast');if(!t)return;t.textContent=msg;clearTimeout(_toastTimer);t.classList.add('show');_toastTimer=setTimeout(()=>{t.classList.remove('show');},2800);}
-async function api(url,opts){const r=await fetch(url,opts);const j=await r.json().catch(()=>({}));if(r.status===401){window.location.href='/login';throw new Error('nao autenticado');}return {r,j};}
-async function logout(){await fetch('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(()=>{});window.location.href='/login';}
+const _PATH_RESERVED=new Set(['','login','logout','api','assets','static','store-image','favicon.ico']);
+function _basePrefix(){const p=String(window.location.pathname||'/');const segs=p.split('/').filter(Boolean);if(!segs.length)return '';const first=String(segs[0]||'').toLowerCase();if(_PATH_RESERVED.has(first))return '';return `/${segs[0]}`;}
+const _BASE_PREFIX=_basePrefix();
+function _url(path){const p=String(path||'');if(!p.startsWith('/'))return p;if(!_BASE_PREFIX)return p;return p.startsWith(`${_BASE_PREFIX}/`)||p===_BASE_PREFIX?p:`${_BASE_PREFIX}${p}`;}
+function goHub(){window.location.href='/';}
+function initHubBackButton(){const b=document.getElementById('backHubBtn');if(!b)return;if(_BASE_PREFIX)b.classList.remove('hidden');else b.classList.add('hidden');}
+async function api(url,opts){const r=await fetch(_url(url),opts);const j=await r.json().catch(()=>({}));if(r.status===401){window.location.href=_url('/login');throw new Error('nao autenticado');}return {r,j};}
+async function logout(){await fetch(_url('/api/logout'),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(()=>{});window.location.href=_url('/login');}
 const _cfgEditIds=['mode','maxPages','pageSize','intervalMin'];
 let _cfgDirty=false;
 let _authCtx={user:'',role:'user',is_admin:false,is_dev:false,can_operate:false,can_manage_users:false,can_change_password:false,can_view_audit:false,users:[]};
@@ -1674,6 +1681,7 @@ bindDigitsOnly('maxPages',1,20);
 bindDigitsOnly('pageSize',1,500);
 bindDigitsOnly('intervalMin',1,720);
 _bindExpanders();
+initHubBackButton();
 const _pwdNewInput=document.getElementById('pwdNew');
 if(_pwdNewInput){_pwdNewInput.addEventListener('input',_updatePwdReqUi);}
 _updatePwdReqUi();
