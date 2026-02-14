@@ -858,6 +858,8 @@ p{margin:0 0 12px;color:#6b4128}
 label{display:block;margin-top:8px;font-weight:600;color:#5c341c}
 input{width:100%;padding:10px;margin-top:4px;border:1px solid #d6b18f;border-radius:8px;background:#fffdfb;font-family:inherit}
 button{margin-top:12px;width:100%;padding:10px 12px;border:0;border-radius:9px;background:linear-gradient(90deg,var(--o),var(--o2));color:#2b1408;font-weight:700;cursor:pointer}
+.btn-sec{background:linear-gradient(90deg,#6b4128,#4a2b18);color:#fff9f3}
+.hidden{display:none !important}
 .msg{margin-top:10px;font-size:.9rem;color:#9c2c1d;min-height:20px}
 </style></head><body>
 <section class="card">
@@ -866,9 +868,21 @@ button{margin-top:12px;width:100%;padding:10px 12px;border:0;border-radius:9px;b
 <label>Usuário</label><input id="u" type="text" autocomplete="username"/>
 <label>Senha</label><input id="p" type="password" autocomplete="current-password"/>
 <button id="b" onclick="login()">Entrar</button>
+<button id="hubBackLogin" class="btn-sec hidden" type="button" onclick="backToHub()">Voltar ao HUB</button>
 <div id="m" class="msg"></div>
 </section>
 <script>
+const _PATH_RESERVED=new Set(['','login','logout','api','assets','static','store-image','favicon.ico']);
+function _basePrefix(){const p=String(window.location.pathname||'/');const segs=p.split('/').filter(Boolean);if(!segs.length)return '';const first=String(segs[0]||'').toLowerCase();if(_PATH_RESERVED.has(first))return '';return `/${segs[0]}`;}
+const _BASE_PREFIX=_basePrefix();
+function backToHub(){
+  try{
+    const ref=document.referrer?new URL(document.referrer):null;
+    if(ref&&ref.origin){window.location.assign(ref.origin+'/');return;}
+  }catch(_){}
+  window.location.assign(new URL('/',window.location.origin).toString());
+}
+function initHubBackLogin(){const b=document.getElementById('hubBackLogin');if(!b)return;if(_BASE_PREFIX)b.classList.remove('hidden');}
 async function login(){
   const u=document.getElementById('u').value||'';
   const p=document.getElementById('p').value||'';
@@ -888,6 +902,7 @@ async function login(){
   }
 }
 ['u','p'].forEach(id=>{document.getElementById(id).addEventListener('keydown',(e)=>{if(e.key==='Enter')login();});});
+initHubBackLogin();
 </script></body></html>"""
 
 
