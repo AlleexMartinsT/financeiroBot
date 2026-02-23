@@ -1505,7 +1505,15 @@ pre{margin:6px 0 0;background:#fff7ef;border:1px dashed #cf9f78;padding:8px;bord
 <script>
 const tech=document.getElementById('tech');
 function switchTab(tab){const main=document.getElementById('tabMain');const hist=document.getElementById('tabHist');const reg=document.getElementById('tabReg');const diag=document.getElementById('tabDiag');const bMain=document.getElementById('tabBtnMain');const bHist=document.getElementById('tabBtnHist');const bReg=document.getElementById('tabBtnReg');const bDiag=document.getElementById('tabBtnDiag');if(tab==='reg'&&!_authCtx.can_view_audit){tab='main';}main.classList.add('hidden');hist.classList.add('hidden');reg.classList.add('hidden');diag.classList.add('hidden');bMain.classList.remove('active');bHist.classList.remove('active');bReg.classList.remove('active');bDiag.classList.remove('active');if(tab==='diag'){diag.classList.remove('hidden');bDiag.classList.add('active');}else if(tab==='hist'){hist.classList.remove('hidden');bHist.classList.add('active');}else if(tab==='reg'){reg.classList.remove('hidden');bReg.classList.add('active');loadAudit(true);}else{main.classList.remove('hidden');bMain.classList.add('active');}}
-const fmt=(s)=>{s=Math.max(0,Number(s||0));const m=String(Math.floor(s/60)).padStart(2,'0');const ss=String(s%60).padStart(2,'0');return `${m}:${ss}`};
+const fmt=(s)=>{
+  s=Math.max(0,Number(s||0));
+  const h=Math.floor(s/3600);
+  const m=Math.floor((s%3600)/60);
+  const ss=Math.floor(s%60);
+  if(h>0)return `${h}h ${m}min ${ss}s`;
+  if(m>0)return `${m}min ${ss}s`;
+  return `${ss}s`;
+};
 const pill=(id,st)=>{const e=document.getElementById(id);let l='Esperando',c='warn';if(st==='ok'){l='Funcionando';c='ok'}else if(st==='error'){l='Com problema';c='err'}else if(st==='running'){l='Lendo e-mails';c='warn'}else if(st==='cooldown'){l='Limite atingido';c='cd'}e.className=`pill ${c}`;e.innerHTML=`<span class="dot"></span>${l}`};
 const box=(msg,k)=>{const e=document.getElementById('fr');const c=k==='error'?'err':(k==='warn'?'warn':'info');e.className=`pill ${c}`;e.innerHTML=`<span class="dot"></span>${msg}`};
 const fill=(id,arr)=>{const ul=document.getElementById(id);ul.innerHTML='';const a=Array.isArray(arr)?arr:[];if(!a.length){const li=document.createElement('li');li.textContent='Sem itens';ul.appendChild(li);return;}a.forEach(x=>{const li=document.createElement('li');li.textContent=String(x);ul.appendChild(li);});};
