@@ -2,7 +2,6 @@
 import sys
 import time
 import argparse
-import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -90,11 +89,9 @@ def _setup_auto_updater():
 
 def _restart_process(reason: str):
     print(f"[Updater] {reason}. Reiniciando processo...")
-    try:
-        args = [sys.executable] + sys.argv
-        subprocess.Popen(args, cwd=str(Path(__file__).resolve().parent))
-    finally:
-        os._exit(0)
+    os.chdir(str(Path(__file__).resolve().parent))
+    args = [sys.executable] + sys.argv
+    os.execv(sys.executable, args)
 
 
 def _check_and_restart_if_update():
