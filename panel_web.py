@@ -1332,6 +1332,7 @@ button:disabled{cursor:not-allowed;opacity:.55;filter:saturate(.45)}
 .lists{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.box{border:1px solid #e4c6a7;border-radius:10px;background:#fffdfb;padding:8px}.box h4{margin:0 0 6px;font-size:.85rem;color:#58311b}.box ul{margin:0;padding-left:16px;max-height:160px;overflow:auto}.box li{margin:3px 0;font-size:.8rem}
 .cfg-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(140px,170px) minmax(220px,260px);gap:10px;align-items:start}
 .cfg-main-card,.cfg-auth-card{height:250px}
+.cfg-main-card h3{text-align:center}
 .cfg-main{display:grid;gap:8px}
 .cfg-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;align-items:end;justify-items:center}
 .cfg-fields > div{display:flex;flex-direction:column;align-items:center}
