@@ -99,9 +99,48 @@ def _match_search(item: dict, query: str) -> bool:
         item.get("status", ""),
         item.get("arquivo_xml", ""),
         item.get("local_lancamento", ""),
+        item.get("vencimento", ""),
+        item.get("parcela", ""),
+        item.get("empresa", ""),
+        item.get("aba", ""),
     ]
     hay = " ".join(str(f) for f in fields).lower()
     return q in hay
+
+
+def _match_exact_ci(value: str, filter_value: str) -> bool:
+    if not filter_value:
+        return True
+    return str(value or "").strip().lower() == str(filter_value or "").strip().lower()
+
+
+def _date_br_to_sort(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "T" in text:
+        return _date_part(text)
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        return text[:10]
+    parts = text.split("/")
+    if len(parts) == 3:
+        dd, mm, yyyy = parts
+        if len(yyyy) == 4:
+            return f"{yyyy.zfill(4)}-{mm.zfill(2)}-{dd.zfill(2)}"
+    return text[:10]
+
+
+def _in_optional_date_range(value: str, dt_from: str, dt_to: str) -> bool:
+    if not dt_from and not dt_to:
+        return True
+    day = _date_br_to_sort(value)
+    if not day:
+        return False
+    if dt_from and day < dt_from:
+        return False
+    if dt_to and day > dt_to:
+        return False
+    return True
 
 
 def query_events(
@@ -111,6 +150,11 @@ def query_events(
     cnpj_dest: str = "",
     event_type: str = "",
     query: str = "",
+    conta: str = "",
+    doc_tipo: str = "",
+    empresa: str = "",
+    venc_from: str = "",
+    venc_to: str = "",
     limit: int = 500,
 ) -> list[dict]:
     _ensure_parent()
@@ -136,6 +180,14 @@ def query_events(
         if not _match_filter(str(item.get("cnpj_emit", "")), cnpj_emit):
             continue
         if not _match_filter(str(item.get("cnpj_dest", "")), cnpj_dest):
+            continue
+        if not _match_exact_ci(str(item.get("conta", "")), conta):
+            continue
+        if not _match_exact_ci(str(item.get("doc_tipo", "")), doc_tipo):
+            continue
+        if not _match_exact_ci(str(item.get("empresa", "")), empresa):
+            continue
+        if not _in_optional_date_range(str(item.get("vencimento", "")), venc_from, venc_to):
             continue
         if not _match_search(item, query):
             continue

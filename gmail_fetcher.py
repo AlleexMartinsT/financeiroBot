@@ -9,6 +9,46 @@ from reporter import limparRelatoriosAntigos
 from settings_manager import load_settings
 from history_store import log_email_processado
 
+
+def _unique_messages(messages):
+    vistos = set()
+    out = []
+    for item in messages or []:
+        if isinstance(item, str):
+            msg_id = item
+            msg = {"id": msg_id}
+        elif isinstance(item, dict):
+            msg_id = item.get("id")
+            msg = item
+        else:
+            continue
+        if msg_id and msg_id not in vistos:
+            vistos.add(msg_id)
+            out.append(msg)
+    return out
+
+
+def listar_mensagens_por_query(gmail_service, query, max_messages=100, page_size=100):
+    """Lista mensagens do Gmail por query, preservando somente IDs unicos."""
+    max_messages = max(1, int(max_messages or 100))
+    page_size = max(1, min(int(page_size or 100), 500))
+    mensagens_brutas = []
+    next_page_token = None
+    while len(mensagens_brutas) < max_messages:
+        req = gmail_service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=min(page_size, max_messages - len(mensagens_brutas)),
+            pageToken=next_page_token,
+        )
+        results = req.execute()
+        batch = results.get("messages", [])
+        mensagens_brutas.extend(batch)
+        next_page_token = results.get("nextPageToken")
+        if not next_page_token or not batch:
+            break
+    return _unique_messages(mensagens_brutas)
+
 def _query_periodo(filtro_periodo_emails):
     base = (
         'has:attachment filename:xml in:inbox -in:sent -in:drafts '
@@ -62,53 +102,59 @@ def getLabelID(gmail_service, label_name):
     return novoLabel["id"]
 
 
-def processarEmails(gmail_service, origemNome, stop_event=None):
+def processarEmails(gmail_service, origemNome, stop_event=None, messages_override=None, query_override=None, progress_callback=None):
     """Busca e baixa XMLs de uma conta Gmail e os processa."""
     label_processado = getLabelID(gmail_service, "XML Processado")
     label_analisado = getLabelID(gmail_service, "XML Analisado")
 
-    cfg = load_settings()
-    query = _query_periodo(cfg.get("gmail_filter_mode", "last_30_days"))
-    max_paginas = int(cfg.get("gmail_max_pages", 3))
-    page_size = int(cfg.get("gmail_page_size", 50))
+    def notify(event, **payload):
+        if callable(progress_callback):
+            try:
+                progress_callback(event, payload)
+            except Exception:
+                pass
 
-    mensagens_brutas = []
-    next_page_token = None
-    for _ in range(max_paginas):
-        if stop_event and stop_event.is_set():
-            print(f"({origemNome}) Leitura manual interrompida antes de concluir as paginas.")
-            break
-        req = gmail_service.users().messages().list(
-            userId="me",
-            q=query,
-            maxResults=page_size,
-            pageToken=next_page_token,
-        )
-        results = req.execute()
-        mensagens_brutas.extend(results.get("messages", []))
-        next_page_token = results.get("nextPageToken")
-        if not next_page_token:
-            break
+    if messages_override is not None:
+        query = query_override or "messages_override"
+        messages = _unique_messages(messages_override)
+    else:
+        cfg = load_settings()
+        query = query_override or _query_periodo(cfg.get("gmail_filter_mode", "last_30_days"))
+        max_paginas = int(cfg.get("gmail_max_pages", 3))
+        page_size = int(cfg.get("gmail_page_size", 50))
 
-    vistos = set()
-    messages = []
-    for m in mensagens_brutas:
-        mid = m.get("id")
-        if mid and mid not in vistos:
-            vistos.add(mid)
-            messages.append(m)
+        mensagens_brutas = []
+        next_page_token = None
+        for _ in range(max_paginas):
+            if stop_event and stop_event.is_set():
+                print(f"({origemNome}) Leitura manual interrompida antes de concluir as paginas.")
+                break
+            req = gmail_service.users().messages().list(
+                userId="me",
+                q=query,
+                maxResults=page_size,
+                pageToken=next_page_token,
+            )
+            results = req.execute()
+            mensagens_brutas.extend(results.get("messages", []))
+            next_page_token = results.get("nextPageToken")
+            if not next_page_token:
+                break
+        messages = _unique_messages(mensagens_brutas)
 
     print(f"({origemNome}) {len(messages)} e-mails com XML encontrados")
+    notify("listed", total=len(messages), query=query)
 
     emailsSemXML = 0
     xmlsProcessadosTOTAL = 0
 
     interrompido = False
-    for msg in messages:
+    for idx, msg in enumerate(messages, start=1):
         if stop_event and stop_event.is_set():
             interrompido = True
             break
         msgID = msg["id"]
+        notify("message", done=idx - 1, total=len(messages), msg_id=msgID)
 
         try:
             message = gmail_service.users().messages().get(
@@ -250,6 +296,8 @@ def processarEmails(gmail_service, origemNome, stop_event=None):
         if interrompido:
             break
 
+        notify("message", done=idx, total=len(messages), msg_id=msgID)
+
     if xmlsProcessadosTOTAL > 0:
         print(f"({origemNome}) {xmlsProcessadosTOTAL} XML(s) processado(s).")
     elif emailsSemXML < len(messages):
@@ -260,3 +308,12 @@ def processarEmails(gmail_service, origemNome, stop_event=None):
     else:
         print(f"({origemNome}) Verificacao finalizada.\n")
     limparRelatoriosAntigos()
+    summary = {
+        "messages_found": len(messages),
+        "emails_sem_xml": int(emailsSemXML),
+        "xmls_processados": int(xmlsProcessadosTOTAL),
+        "interrompido": bool(interrompido),
+        "query": query,
+    }
+    notify("done", **summary)
+    return summary

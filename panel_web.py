@@ -1,6 +1,8 @@
 ﻿import json
+import csv
 import hashlib
 import hmac
+import io
 import re
 import secrets
 import socket
@@ -9,7 +11,7 @@ import time
 import traceback
 import webbrowser
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -18,7 +20,8 @@ import auth
 import runtime_status
 from audit_store import append_audit_event, query_audit_events
 from config import RELATORIO_DIR, CNPJ_EH, CNPJ_MVA, APPDATA_BASE
-from gmail_fetcher import processarEmails
+from finance_sheets import gerar_conferencia, query_prazos
+from gmail_fetcher import listar_mensagens_por_query, processarEmails
 from history_store import query_events
 from settings_manager import load_settings, save_settings
 
@@ -37,8 +40,26 @@ _manual_stop_event = threading.Event()
 _manual_state = {
     "running": False,
     "account": "",
+    "kind": "",
+    "job_id": "",
     "started_at": None,
+    "finished_at": None,
     "cancel_requested": False,
+    "message": "",
+    "done": 0,
+    "total": 0,
+    "result": {},
+}
+_conferencia_lock = threading.Lock()
+_conferencia_state = {
+    "running": False,
+    "job_id": "",
+    "started_at": None,
+    "finished_at": None,
+    "message": "",
+    "params": {},
+    "result": [],
+    "error": "",
 }
 _COOKIE_SESSION = "financebot_session"
 _SESSION_TTL_SECONDS = 8 * 60 * 60
@@ -518,6 +539,21 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict, 
     handler.wfile.write(raw)
 
 
+def _csv_response(handler: BaseHTTPRequestHandler, filename: str, rows: list[dict], fieldnames: list[str]):
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore", delimiter=";")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    raw = buf.getvalue().encode("utf-8-sig")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/csv; charset=utf-8")
+    handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+    handler.send_header("Content-Length", str(len(raw)))
+    handler.end_headers()
+    handler.wfile.write(raw)
+
+
 def _html_response(handler: BaseHTTPRequestHandler, status: int, html: str):
     raw = html.encode("utf-8")
     handler.send_response(status)
@@ -547,6 +583,317 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict:
 def _label_map(service) -> dict:
     labels = service.users().labels().list(userId="me").execute().get("labels", [])
     return {x["name"].lower(): x["id"] for x in labels}
+
+
+def _account_label(account: str) -> str:
+    return "Conta Principal" if account == "principal" else "Conta NFe"
+
+
+def _accounts_for(account: str) -> list[str]:
+    acc = str(account or "principal").strip().lower()
+    if acc == "all":
+        return ["principal", "nfe"]
+    if acc in {"principal", "nfe"}:
+        return [acc]
+    raise ValueError("Conta invalida. Use principal, nfe ou all.")
+
+
+def _begin_manual_job(kind: str, account: str, message: str) -> tuple[bool, dict]:
+    with _manual_lock:
+        if _manual_state["running"]:
+            return False, dict(_manual_state)
+        _manual_stop_event.clear()
+        _manual_state.update(
+            {
+                "running": True,
+                "account": account,
+                "kind": kind,
+                "job_id": secrets.token_hex(8),
+                "started_at": datetime.now().isoformat(),
+                "finished_at": None,
+                "cancel_requested": False,
+                "message": message,
+                "done": 0,
+                "total": 0,
+                "result": {},
+            }
+        )
+        return True, dict(_manual_state)
+
+
+def _update_manual_job(**kwargs):
+    with _manual_lock:
+        for key, value in kwargs.items():
+            if key in _manual_state:
+                _manual_state[key] = value
+
+
+def _finish_manual_job(message: str, result: dict | None = None):
+    with _manual_lock:
+        _manual_state["running"] = False
+        _manual_state["account"] = ""
+        _manual_state["finished_at"] = datetime.now().isoformat()
+        _manual_state["cancel_requested"] = False
+        _manual_state["message"] = message
+        _manual_state["result"] = result or {}
+    _manual_stop_event.clear()
+
+
+def _progress_callback(account: str, action: str):
+    def _cb(event: str, payload: dict):
+        total = int(payload.get("total", 0) or 0)
+        done = int(payload.get("done", 0) or 0)
+        if event == "listed":
+            _update_manual_job(total=total, done=0, message=f"{action}: {total} mensagem(ns) localizada(s) em {_account_label(account)}")
+        elif event == "message":
+            _update_manual_job(total=total, done=done, message=f"{action}: {_account_label(account)} {done}/{total}")
+        elif event == "done":
+            _update_manual_job(total=total, done=total, message=f"{action}: {_account_label(account)} concluida")
+    return _cb
+
+
+def _gmail_date(value: str, add_day: bool = False) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    dt = datetime.strptime(text[:10], "%Y-%m-%d").date()
+    if add_day:
+        dt = dt + timedelta(days=1)
+    return dt.strftime("%Y/%m/%d")
+
+
+def _numbers_from_payload(data: dict) -> list[str]:
+    mode = str(data.get("mode", "") or "").strip().lower()
+    raw_items = data.get("nf_list") or data.get("numbers") or data.get("docs") or ""
+    numbers = []
+    if isinstance(raw_items, list):
+        source = " ".join(str(x) for x in raw_items)
+    else:
+        source = str(raw_items or "")
+    for a, b in re.findall(r"\b(\d{1,12})\s*(?:-|a|ate|até)\s*(\d{1,12})\b", source, flags=re.IGNORECASE):
+        start = int(a)
+        end = int(b)
+        if end >= start and (end - start) <= 1000:
+            width = max(len(a), len(b))
+            numbers.extend(str(n).zfill(width) for n in range(start, end + 1))
+    numbers.extend(re.findall(r"\d+", source))
+    if mode == "range" or data.get("start") or data.get("end"):
+        start = int(re.sub(r"\D+", "", str(data.get("start", "") or "0")) or "0")
+        end = int(re.sub(r"\D+", "", str(data.get("end", "") or "0")) or "0")
+        if start and end and end >= start and (end - start) <= 1000:
+            width = max(len(str(data.get("start", ""))), len(str(data.get("end", ""))))
+            numbers.extend(str(n).zfill(width) for n in range(start, end + 1))
+    seen = set()
+    out = []
+    for n in numbers:
+        n = str(n).strip()
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _recover_query(data: dict) -> tuple[str, list[str]]:
+    query = "has:attachment filename:xml in:inbox -in:sent -in:drafts"
+    dt_from = str(data.get("date_from") or data.get("from") or "").strip()
+    dt_to = str(data.get("date_to") or data.get("to") or "").strip()
+    if dt_from:
+        query += f" after:{_gmail_date(dt_from)}"
+    if dt_to:
+        query += f" before:{_gmail_date(dt_to, add_day=True)}"
+    numbers = _numbers_from_payload(data)
+    if numbers:
+        query_numbers = numbers[:50]
+        query += " {" + " ".join(query_numbers) + "}"
+    return query, numbers
+
+
+def _message_internal_date(service, msg_id: str) -> tuple[int, str]:
+    try:
+        message = service.users().messages().get(
+            userId="me",
+            id=msg_id,
+            format="metadata",
+            metadataHeaders=["Subject"],
+        ).execute()
+        subject = ""
+        for h in message.get("payload", {}).get("headers", []) or []:
+            if str(h.get("name", "")).lower() == "subject":
+                subject = str(h.get("value", ""))
+                break
+        return int(message.get("internalDate", "0") or 0), subject
+    except Exception:
+        return 0, ""
+
+
+def _list_processed_messages(service, days: int, max_messages: int) -> list[dict]:
+    q = f'in:inbox newer_than:{max(1, int(days or 30))}d {{label:"XML Processado" label:"XML Analisado"}}'
+    messages = listar_mensagens_por_query(service, q, max_messages=max_messages, page_size=100)
+    enriched = []
+    for msg in messages:
+        msg_id = msg.get("id")
+        internal_ms, subject = _message_internal_date(service, msg_id)
+        item = dict(msg)
+        item["internalDate"] = str(internal_ms)
+        item["subject"] = subject
+        enriched.append(item)
+    enriched.sort(key=lambda x: int(x.get("internalDate") or 0), reverse=True)
+    return enriched
+
+
+def _prepare_reprocess_messages(service, messages: list[dict], mark_unread: bool) -> int:
+    labels = _label_map(service)
+    remove_ids = [labels[name] for name in ("xml processado", "xml analisado") if name in labels]
+    add_ids = ["UNREAD"] if mark_unread else []
+    if not remove_ids and not add_ids:
+        return 0
+    updated = 0
+    for msg in messages:
+        msg_id = msg.get("id")
+        if not msg_id:
+            continue
+        service.users().messages().modify(
+            userId="me",
+            id=msg_id,
+            body={"removeLabelIds": remove_ids, "addLabelIds": add_ids},
+        ).execute()
+        updated += 1
+    return updated
+
+
+def _run_reprocess_job(actor: str, account: str, days: int, max_messages: int, mark_unread: bool, req_payload: dict):
+    global _last_run
+    result = {}
+    try:
+        _last_run = {"status": "running", "message": "Reprocessamento em andamento", "friendly": "Reprocessamento iniciado", "at": datetime.now().isoformat()}
+        for acc in _accounts_for(account):
+            if _manual_stop_event.is_set():
+                break
+            runtime_status.set_account_status(acc, "running", "Reprocessando e-mails selecionados")
+            service = auth.get_gmail_service(acc)
+            messages = _list_processed_messages(service, days, max_messages)
+            updated = _prepare_reprocess_messages(service, messages, mark_unread)
+            summary = processarEmails(
+                service,
+                _account_label(acc),
+                stop_event=_manual_stop_event,
+                messages_override=messages,
+                query_override="reprocessamento_lote_exato",
+                progress_callback=_progress_callback(acc, "Reprocessamento"),
+            )
+            summary["messages_preparadas"] = updated
+            result[acc] = summary
+            runtime_status.set_account_status(acc, "ok", "Reprocessamento concluido")
+
+        stopped = _manual_stop_event.is_set()
+        status = "stopped" if stopped else "ok"
+        message = "Reprocessamento interrompido" if stopped else "Reprocessamento concluido"
+        _last_run = {"status": status, "message": message, "friendly": message, "at": datetime.now().isoformat()}
+        _audit(actor=actor, action="reprocessar_emails", target=str(account), before=req_payload, after=result, status="ok", details=message)
+        _finish_manual_job(message, result)
+    except Exception as e:
+        raw = str(e)
+        _add_diagnostic("reprocess", e)
+        for acc in _accounts_for(account):
+            runtime_status.set_account_status(acc, "error", _friendly_error(raw))
+        _last_run = {"status": "error", "message": raw, "friendly": _friendly_error(raw), "at": datetime.now().isoformat()}
+        _audit(actor=actor, action="reprocessar_emails", target=str(account), before=req_payload, after={}, status="erro", details=raw)
+        _finish_manual_job(_friendly_error(raw), {"error": raw})
+
+
+def _run_recover_job(actor: str, account: str, payload: dict):
+    global _last_run
+    result = {}
+    try:
+        query, numbers = _recover_query(payload)
+        max_messages = max(1, min(int(payload.get("max_messages", 200) or 200), 1000))
+        _last_run = {"status": "running", "message": "Recuperacao em andamento", "friendly": "Recuperacao iniciada", "at": datetime.now().isoformat()}
+        _update_manual_job(message="Recuperacao: buscando mensagens", total=0, done=0)
+        for acc in _accounts_for(account):
+            if _manual_stop_event.is_set():
+                break
+            runtime_status.set_account_status(acc, "running", "Recuperando e-mails por consulta")
+            service = auth.get_gmail_service(acc)
+            messages = listar_mensagens_por_query(service, query, max_messages=max_messages, page_size=100)
+            summary = processarEmails(
+                service,
+                _account_label(acc),
+                stop_event=_manual_stop_event,
+                messages_override=messages,
+                query_override=query,
+                progress_callback=_progress_callback(acc, "Recuperacao"),
+            )
+            summary["docs_informados"] = numbers
+            result[acc] = summary
+            runtime_status.set_account_status(acc, "ok", "Recuperacao concluida")
+
+        stopped = _manual_stop_event.is_set()
+        status = "stopped" if stopped else "ok"
+        message = "Recuperacao interrompida" if stopped else "Recuperacao concluida"
+        _last_run = {"status": status, "message": message, "friendly": message, "at": datetime.now().isoformat()}
+        _audit(actor=actor, action="recuperar_emails", target=str(account), before=payload, after=result, status="ok", details=message)
+        _finish_manual_job(message, result)
+    except Exception as e:
+        raw = str(e)
+        _add_diagnostic("recover_emails", e)
+        for acc in _accounts_for(account):
+            runtime_status.set_account_status(acc, "error", _friendly_error(raw))
+        _last_run = {"status": "error", "message": raw, "friendly": _friendly_error(raw), "at": datetime.now().isoformat()}
+        _audit(actor=actor, action="recuperar_emails", target=str(account), before=payload, after={}, status="erro", details=raw)
+        _finish_manual_job(_friendly_error(raw), {"error": raw})
+
+
+def _conferencia_snapshot() -> dict:
+    with _conferencia_lock:
+        out = dict(_conferencia_state)
+        out["result"] = list(_conferencia_state.get("result") or [])
+        out["params"] = dict(_conferencia_state.get("params") or {})
+        return out
+
+
+def _run_conferencia_job(actor: str, params: dict):
+    try:
+        with _conferencia_lock:
+            _conferencia_state["message"] = "Lendo planilhas"
+        result = gerar_conferencia(
+            empresa=str(params.get("empresa", "") or ""),
+            ano=str(params.get("ano", "") or ""),
+            query=str(params.get("q", "") or ""),
+            include_ok=bool(params.get("include_ok", True)),
+            limit=max(1, min(int(params.get("limit", 1000) or 1000), 5000)),
+        )
+        with _conferencia_lock:
+            _conferencia_state["running"] = False
+            _conferencia_state["finished_at"] = datetime.now().isoformat()
+            _conferencia_state["message"] = f"Conferencia concluida com {len(result)} documento(s)"
+            _conferencia_state["result"] = result
+            _conferencia_state["error"] = ""
+        _audit(
+            actor=actor,
+            action="conferencia_parcelas",
+            target=str(params.get("empresa", "all") or "all"),
+            before=params,
+            after={"items": len(result)},
+            status="ok",
+            details="Conferencia concluida",
+        )
+    except Exception as e:
+        raw = str(e)
+        _add_diagnostic("conferencia_parcelas", e)
+        with _conferencia_lock:
+            _conferencia_state["running"] = False
+            _conferencia_state["finished_at"] = datetime.now().isoformat()
+            _conferencia_state["message"] = _friendly_error(raw)
+            _conferencia_state["error"] = raw
+        _audit(
+            actor=actor,
+            action="conferencia_parcelas",
+            target=str(params.get("empresa", "all") or "all"),
+            before=params,
+            after={},
+            status="erro",
+            details=raw,
+        )
 
 
 def _reprocess_recent(service, days: int, max_messages: int, mark_unread: bool) -> dict:
@@ -624,8 +971,15 @@ def _run_now(account: str):
             return
         _manual_state["running"] = True
         _manual_state["account"] = account
+        _manual_state["kind"] = "run_now"
+        _manual_state["job_id"] = secrets.token_hex(8)
         _manual_state["started_at"] = datetime.now().isoformat()
+        _manual_state["finished_at"] = None
         _manual_state["cancel_requested"] = False
+        _manual_state["message"] = "Execucao manual iniciada"
+        _manual_state["done"] = 0
+        _manual_state["total"] = 0
+        _manual_state["result"] = {}
         _manual_stop_event.clear()
 
     _last_run = {"status": "running", "message": f"Executando conta {account}", "friendly": "Execução manual iniciada", "at": datetime.now().isoformat()}
@@ -676,8 +1030,10 @@ def _run_now(account: str):
         with _manual_lock:
             _manual_state["running"] = False
             _manual_state["account"] = ""
-            _manual_state["started_at"] = None
+            _manual_state["finished_at"] = datetime.now().isoformat()
             _manual_state["cancel_requested"] = False
+            _manual_state["message"] = _last_run.get("friendly") or _last_run.get("message", "")
+            _manual_state["result"] = {"last_run": _last_run}
         _manual_stop_event.clear()
 
 
@@ -875,6 +1231,7 @@ button{margin-top:12px;width:100%;padding:10px 12px;border:0;border-radius:9px;b
 const _PATH_RESERVED=new Set(['','login','logout','api','assets','static','store-image','favicon.ico']);
 function _basePrefix(){const p=String(window.location.pathname||'/');const segs=p.split('/').filter(Boolean);if(!segs.length)return '';const first=String(segs[0]||'').toLowerCase();if(_PATH_RESERVED.has(first))return '';return `/${segs[0]}`;}
 const _BASE_PREFIX=_basePrefix();
+function _url(path){const p=String(path||'');if(!p.startsWith('/'))return p;if(!_BASE_PREFIX)return p;return p.startsWith(`${_BASE_PREFIX}/`)||p===_BASE_PREFIX?p:`${_BASE_PREFIX}${p}`;}
 function backToHub(){
   try{
     const ref=document.referrer?new URL(document.referrer):null;
@@ -891,9 +1248,9 @@ async function login(){
   b.disabled=true;
   m.textContent='Validando acesso';
   try{
-    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    const r=await fetch(_url('/api/login'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
     const j=await r.json();
-    if(r.ok&&j.ok){window.location.href='/';return;}
+    if(r.ok&&j.ok){window.location.href=_url('/');return;}
     m.textContent=j.message||'Usuário ou senha inválidos';
   }catch(_){
     m.textContent='Falha ao conectar com o servidor';
@@ -904,6 +1261,46 @@ async function login(){
 ['u','p'].forEach(id=>{document.getElementById(id).addEventListener('keydown',(e)=>{if(e.key==='Enter')login();});});
 initHubBackLogin();
 </script></body></html>"""
+
+
+def _history_items_from_qs(qs: dict) -> list[dict]:
+    dt_from = (qs.get("from", [""])[0] or "").strip()
+    dt_to = (qs.get("to", [""])[0] or "").strip()
+    cnpj_emit = (qs.get("cnpj_emit", [""])[0] or "").strip()
+    cnpj_dest = (qs.get("cnpj_dest", [""])[0] or "").strip()
+    query = (qs.get("q", [""])[0] or "").strip()
+    conta = (qs.get("conta", [""])[0] or "").strip()
+    doc_tipo = (qs.get("doc_tipo", [""])[0] or "").strip()
+    empresa = (qs.get("empresa", [""])[0] or "").strip()
+    venc_from = (qs.get("venc_from", [""])[0] or "").strip()
+    venc_to = (qs.get("venc_to", [""])[0] or "").strip()
+    try:
+        limit = int((qs.get("limit", ["500"])[0] or "500").strip())
+    except Exception:
+        limit = 500
+    items = query_events(
+        dt_from=dt_from,
+        dt_to=dt_to,
+        cnpj_emit=cnpj_emit,
+        cnpj_dest=cnpj_dest,
+        event_type="boleto_lancado",
+        query=query,
+        conta=conta,
+        doc_tipo=doc_tipo,
+        empresa=empresa,
+        venc_from=venc_from,
+        venc_to=venc_to,
+        limit=max(1, min(limit, 5000)),
+    )
+    for item in items:
+        dest = str(item.get("cnpj_dest", "")).strip()
+        if dest == CNPJ_MVA:
+            item["dest_label"] = "MVA"
+        elif dest == CNPJ_EH:
+            item["dest_label"] = "EH"
+        else:
+            item["dest_label"] = ""
+    return items
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -959,37 +1356,69 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/diagnostics":
             with _diag_lock:
                 items = list(_diagnostics[-30:])
-            return _json_response(self, 200, {"items": items})
+            report = _parse_report()
+            operational = [
+                {"at": report.get("updated_at", ""), "source": "relatorio_aviso", "friendly": msg, "raw": msg}
+                for msg in (report.get("avisos") or [])[-20:]
+            ]
+            operational.extend(
+                {"at": report.get("updated_at", ""), "source": "relatorio_erro", "friendly": msg, "raw": msg}
+                for msg in (report.get("erros") or [])[-10:]
+            )
+            return _json_response(self, 200, {"items": items, "operational": operational})
+
+        if parsed.path == "/api/history/export":
+            qs = parse_qs(parsed.query or "")
+            items = _history_items_from_qs(qs)
+            rows = []
+            for item in items:
+                rows.append(
+                    {
+                        "data": item.get("at", ""),
+                        "conta": item.get("conta", ""),
+                        "tipo": item.get("doc_tipo", ""),
+                        "documento": item.get("numero", ""),
+                        "fornecedor": item.get("fornecedor", ""),
+                        "destino": item.get("dest_label", ""),
+                        "vencimento": item.get("vencimento", ""),
+                        "parcela": item.get("parcela", ""),
+                        "valor_total": item.get("valor_total", ""),
+                        "valor_parcela": item.get("valor_parcela", ""),
+                        "local": item.get("local_lancamento", ""),
+                        "arquivo_xml": item.get("arquivo_xml", ""),
+                    }
+                )
+            return _csv_response(
+                self,
+                "financebot_historico.csv",
+                rows,
+                ["data", "conta", "tipo", "documento", "fornecedor", "destino", "vencimento", "parcela", "valor_total", "valor_parcela", "local", "arquivo_xml"],
+            )
 
         if parsed.path == "/api/history":
             qs = parse_qs(parsed.query or "")
-            dt_from = (qs.get("from", [""])[0] or "").strip()
-            dt_to = (qs.get("to", [""])[0] or "").strip()
-            cnpj_emit = (qs.get("cnpj_emit", [""])[0] or "").strip()
-            cnpj_dest = (qs.get("cnpj_dest", [""])[0] or "").strip()
-            query = (qs.get("q", [""])[0] or "").strip()
+            items = _history_items_from_qs(qs)
+            return _json_response(self, 200, {"items": items})
+
+        if parsed.path in {"/api/prazos", "/api/prazos/search"}:
+            qs = parse_qs(parsed.query or "")
             try:
                 limit = int((qs.get("limit", ["500"])[0] or "500").strip())
             except Exception:
                 limit = 500
-            items = query_events(
-                dt_from=dt_from,
-                dt_to=dt_to,
-                cnpj_emit=cnpj_emit,
-                cnpj_dest=cnpj_dest,
-                event_type="boleto_lancado",
-                query=query,
-                limit=max(1, min(limit, 2000)),
+            items = query_prazos(
+                empresa=(qs.get("empresa", [""])[0] or "").strip(),
+                query=(qs.get("q", [""])[0] or "").strip(),
+                status=(qs.get("status", [""])[0] or "").strip(),
+                dt_from=(qs.get("from", [""])[0] or "").strip(),
+                dt_to=(qs.get("to", [""])[0] or "").strip(),
+                days=(qs.get("days", [""])[0] or "").strip(),
+                limit=max(1, min(limit, 5000)),
             )
-            for item in items:
-                dest = str(item.get("cnpj_dest", "")).strip()
-                if dest == CNPJ_MVA:
-                    item["dest_label"] = "MVA"
-                elif dest == CNPJ_EH:
-                    item["dest_label"] = "EH"
-                else:
-                    item["dest_label"] = ""
             return _json_response(self, 200, {"items": items})
+
+        if parsed.path == "/api/conferencia-parcelas/job":
+            return _json_response(self, 200, _conferencia_snapshot())
 
         if parsed.path == "/api/audit":
             if not _is_dev(current_user):
@@ -1143,9 +1572,9 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/reprocess":
             if not _can_operate(current_user):
                 return _json_response(self, 403, {"ok": False, "message": "Sem permissão para reprocessar e-mails"})
-            account = data.get("account", "principal")
-            days = int(data.get("days", 30))
-            max_messages = int(data.get("max_messages", 100))
+            account = str(data.get("account", "principal") or "principal").strip().lower()
+            days = max(1, min(int(data.get("days", 30) or 30), 3650))
+            max_messages = max(1, min(int(data.get("max_messages", 100) or 100), 1000))
             mark_unread = bool(data.get("mark_unread", True))
             req_payload = {
                 "account": account,
@@ -1154,30 +1583,13 @@ class _Handler(BaseHTTPRequestHandler):
                 "mark_unread": mark_unread,
             }
             try:
-                if account == "all":
-                    result = {}
-                    total_matched = 0
-                    total_updated = 0
-                    for acc in ("principal", "nfe"):
-                        service = auth.get_gmail_service(acc)
-                        item = _reprocess_recent(service, days, max_messages, mark_unread)
-                        result[acc] = item
-                        total_matched += int(item.get("matched", 0))
-                        total_updated += int(item.get("updated", 0))
-                    result["total"] = {"matched": total_matched, "updated": total_updated}
-                else:
-                    service = auth.get_gmail_service(account)
-                    result = _reprocess_recent(service, days, max_messages, mark_unread)
-                _audit(
-                    actor=current_user,
-                    action="reprocessar_emails",
-                    target=str(account),
-                    before=req_payload,
-                    after=result,
-                    status="ok",
-                    details="Reprocessamento concluído",
-                )
-                return _json_response(self, 200, {"ok": True, "result": result})
+                _accounts_for(account)
+                ok, snap = _begin_manual_job("reprocess", account, "Reprocessamento iniciado")
+                if not ok:
+                    return _json_response(self, 409, {"ok": False, "message": "Ja existe uma acao manual em andamento", "manual": snap})
+                t = threading.Thread(target=_run_reprocess_job, args=(current_user, account, days, max_messages, mark_unread, req_payload), daemon=True)
+                t.start()
+                return _json_response(self, 202, {"ok": True, "message": "Reprocessamento iniciado", "manual": snap})
             except Exception as e:
                 _add_diagnostic("reprocess", e)
                 _audit(
@@ -1191,10 +1603,77 @@ class _Handler(BaseHTTPRequestHandler):
                 )
                 return _json_response(self, 400, {"ok": False, "friendly": _friendly_error(str(e)), "error": str(e)})
 
+        if parsed.path == "/api/recover-emails":
+            if not _can_operate(current_user):
+                return _json_response(self, 403, {"ok": False, "message": "Sem permissão para recuperar e-mails"})
+            account = str(data.get("account", "principal") or "principal").strip().lower()
+            payload = dict(data or {})
+            payload["account"] = account
+            try:
+                _accounts_for(account)
+                _recover_query(payload)
+                ok, snap = _begin_manual_job("recover_emails", account, "Recuperacao iniciada")
+                if not ok:
+                    return _json_response(self, 409, {"ok": False, "message": "Ja existe uma acao manual em andamento", "manual": snap})
+                t = threading.Thread(target=_run_recover_job, args=(current_user, account, payload), daemon=True)
+                t.start()
+                return _json_response(self, 202, {"ok": True, "message": "Recuperacao iniciada", "manual": snap})
+            except Exception as e:
+                _add_diagnostic("recover_emails", e)
+                _audit(
+                    actor=current_user,
+                    action="recuperar_emails",
+                    target=str(account),
+                    before=payload,
+                    after={},
+                    status="erro",
+                    details=str(e),
+                )
+                return _json_response(self, 400, {"ok": False, "friendly": _friendly_error(str(e)), "error": str(e)})
+
+        if parsed.path == "/api/conferencia-parcelas/start":
+            if not _can_operate(current_user):
+                return _json_response(self, 403, {"ok": False, "message": "Sem permissão para iniciar conferência"})
+            params = {
+                "empresa": str(data.get("empresa", "") or "").strip().upper(),
+                "ano": str(data.get("ano", "") or "").strip(),
+                "q": str(data.get("q", "") or "").strip(),
+                "include_ok": bool(data.get("include_ok", True)),
+                "limit": max(1, min(int(data.get("limit", 1000) or 1000), 5000)),
+            }
+            with _conferencia_lock:
+                if _conferencia_state["running"]:
+                    snap = dict(_conferencia_state)
+                    snap["params"] = dict(_conferencia_state.get("params") or {})
+                    snap["result"] = list(_conferencia_state.get("result") or [])
+                    return _json_response(self, 409, {"ok": False, "message": "Conferência já em andamento", "job": snap})
+                _conferencia_state.update(
+                    {
+                        "running": True,
+                        "job_id": secrets.token_hex(8),
+                        "started_at": datetime.now().isoformat(),
+                        "finished_at": None,
+                        "message": "Conferencia iniciada",
+                        "params": params,
+                        "result": [],
+                        "error": "",
+                    }
+                )
+                snap = dict(_conferencia_state)
+                snap["params"] = dict(_conferencia_state.get("params") or {})
+                snap["result"] = list(_conferencia_state.get("result") or [])
+            t = threading.Thread(target=_run_conferencia_job, args=(current_user, params), daemon=True)
+            t.start()
+            return _json_response(self, 202, {"ok": True, "message": "Conferencia iniciada", "job": snap})
+
         if parsed.path == "/api/run-now":
             if not _can_operate(current_user):
                 return _json_response(self, 403, {"ok": False, "message": "Sem permissão para executar agora"})
-            account = data.get("account", "principal")
+            account = str(data.get("account", "principal") or "principal").strip().lower()
+            try:
+                _accounts_for(account)
+            except Exception as e:
+                return _json_response(self, 400, {"ok": False, "message": str(e)})
             with _manual_lock:
                 if _manual_state["running"]:
                     _audit(
@@ -1428,7 +1907,7 @@ pre{margin:6px 0 0;background:#fff7ef;border:1px dashed #cf9f78;padding:8px;bord
 <div id="ov" class="ov"><div class="ovb"><h4>Reautenticação em andamento</h4><p>Troque para a conta correta no navegador<br/>A autenticação começará em:</p><div id="cnt" class="cnt">5</div></div></div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <main class="app"><div class="top"><span>FinanceBot - Painel de Controle MVA</span><div class="top-right"><span id="whoami" class="whoami">Usuário: -</span><button id="backHubBtn" class="logout-btn hub-back-btn hidden" onclick="goHub()">Voltar ao HUB</button><button class="logout-btn" onclick="logout()">Sair</button></div></div>
-<div class="tabs"><button id="tabBtnMain" class="tab-btn active" onclick="switchTab('main')">Painel</button><button id="tabBtnHist" class="tab-btn" onclick="switchTab('hist')">Histórico</button><button id="tabBtnReg" class="tab-btn hidden" onclick="switchTab('reg')">Registro</button><button id="tabBtnDiag" class="tab-btn" onclick="switchTab('diag')">Diagnóstico</button></div>
+<div class="tabs"><button id="tabBtnMain" class="tab-btn active" onclick="switchTab('main')">Painel</button><button id="tabBtnHist" class="tab-btn" onclick="switchTab('hist')">Histórico</button><button id="tabBtnConf" class="tab-btn" onclick="switchTab('conf')">Conferência</button><button id="tabBtnPra" class="tab-btn" onclick="switchTab('pra')">Prazos</button><button id="tabBtnReg" class="tab-btn hidden" onclick="switchTab('reg')">Registro</button><button id="tabBtnDiag" class="tab-btn" onclick="switchTab('diag')">Diagnóstico</button></div>
 <div id="tabMain" class="c tab-panel">
 <section class="card"><h3>Status das contas de e-mail</h3><div class="status">
 <article class="s"><div class="h"><span>Conta Principal</span><span id="pillP" class="pill warn"><span class="dot"></span>Esperando</span></div><div id="mailP" class="muted">E-mail conectado: -</div><div id="detP" class="muted">Aguardando</div><div id="probP" class="problem"></div></article>
@@ -1449,10 +1928,12 @@ pre{margin:6px 0 0;background:#fff7ef;border:1px dashed #cf9f78;padding:8px;bord
 </div>
 </section>
 <section class="card cfg-auth-card"><h3>Autenticação</h3><div class="btns stack"><button class="sec" onclick="reauth('principal')">Principal</button><button class="sec" onclick="reauth('nfe')">Secundária</button></div></section>
-<section class="card reproc-card"><h3>Reprocessar e-mails</h3>
+<section class="card reproc-card"><h3>Ações de e-mail</h3>
 <div class="reproc-stack"><div><label>Conta</label><select id="account"><option value="all">Todos</option><option value="principal">E-mail Principal</option><option value="nfe">E-mail Secundário</option></select></div><div><label>Dias para trás</label><input id="days" type="number" value="30" min="1" max="365"/></div><div><label>Limite de mensagens</label><input id="limit" type="number" value="100" min="1" max="1000"/></div></div>
 <label class="cb"><input id="unread" type="checkbox" checked/><span>Marcar como não lido</span></label>
-<div class="btns stack"><button onclick="reprocess()">Remover labels para reprocessar</button><button id="runNowBtn" class="sec" onclick="runNow()">Executar agora</button><button id="stopNowBtn" class="sec stop-btn-locked" onclick="stopRunNow()" disabled>Parar</button></div></section>
+<div class="btns stack"><button onclick="reprocess()">Reprocessar lote exato</button><button id="runNowBtn" class="sec" onclick="runNow()">Executar agora</button><button id="stopNowBtn" class="sec stop-btn-locked" onclick="stopRunNow()" disabled>Parar</button></div>
+<div class="reproc-stack" style="margin-top:10px;border-top:1px solid #e4c6a7;padding-top:8px"><div><label>Recuperar docs</label><input id="recoverDocs" type="text" placeholder="NF/CT, lista ou faixa"/></div><div><label>Data inicial</label><input id="recoverFrom" type="date"/></div><div><label>Data final</label><input id="recoverTo" type="date"/></div></div>
+<div class="btns stack"><button class="sec" onclick="recoverEmails()">Recuperar e-mails</button></div></section>
 <section class="card cfg-sec-card"><h3>Configurações</h3><div class="sec-grid">
 <div class="sec-box"><h4>Reiniciar senha</h4><div class="sec-row"><div><label>Senha atual</label><input id="pwdCurr" type="password" autocomplete="current-password"/></div><div><label>Nova senha</label><input id="pwdNew" type="password" autocomplete="new-password"/></div><ul class="pwd-reqs"><li id="reqLen">* Mínimo 6 caracteres</li><li id="reqLower">* Pelo menos uma letra minúscula</li><li id="reqUpper">* Pelo menos uma letra maiúscula</li><li id="reqDigit">* Pelo menos um número</li><li id="reqSpec">* Pelo menos um caractere especial</li></ul><div><label>Confirmar nova senha</label><input id="pwdNew2" type="password" autocomplete="new-password"/></div><div class="sec-actions"><button class="sec" onclick="changeOwnPassword()">Atualizar minha senha</button></div><div class="mini-note">Os requisitos ficam verdes conforme a senha atende cada regra</div></div></div>
 <div id="adminArea" class="sec-box admin-only"><h4>Administração de usuários</h4><div id="userTags" class="user-tags"></div><div class="exp-tabs">
@@ -1470,14 +1951,55 @@ pre{margin:6px 0 0;background:#fff7ef;border:1px dashed #cf9f78;padding:8px;bord
 <div><label>Data final</label><input id="hTo" type="date"/></div>
 <div><label>CNPJ emitente</label><input id="hEmit" type="text" placeholder="Somente números"/></div>
 <div><label>CNPJ destinatário</label><input id="hDest" type="text" placeholder="Somente números"/></div>
+<div><label>Conta</label><select id="hConta"><option value="">Todas</option><option value="Conta Principal">Principal</option><option value="Conta NFe">NFe</option></select></div>
+<div><label>Tipo</label><select id="hTipo"><option value="">Todos</option><option value="NF">NF</option><option value="CT-e">CT-e</option></select></div>
+<div><label>Empresa</label><select id="hEmpresa"><option value="">Todas</option><option value="MVA">MVA</option><option value="EH">EH</option></select></div>
 <div class="search-wide"><label>Busca</label><input id="hQuery" type="text" placeholder="Fornecedor, documento, aba"/></div>
 <div><label>Limite</label><input id="hLimit" type="number" min="10" max="2000" value="300"/></div>
 <div style="display:flex;align-items:end"><button onclick="loadHistory()">Aplicar filtros</button></div>
+<div style="display:flex;align-items:end"><button class="sec" onclick="exportHistory()">Exportar CSV</button></div>
 </div>
 <div class="table-wrap" style="margin-top:10px">
 <table class="hist-table">
 <thead><tr><th class="sortable" data-key="at">Data/Hora</th><th class="sortable" data-key="conta">Conta</th><th class="sortable" data-key="doc">Documento</th><th class="sortable" data-key="fornecedor">Fornecedor</th><th class="sortable" data-key="dest">Destino</th><th class="sortable" data-key="local">Lançado em</th><th class="sortable" data-key="detalhe">Detalhes</th></tr></thead>
 <tbody id="hBody"><tr><td colspan="7">Sem dados</td></tr></tbody>
+</table>
+</div>
+</section>
+</div>
+<div id="tabConf" class="c tab-panel hidden">
+<section class="card"><h3>Conferência de parcelas</h3>
+<div class="hist-filters">
+<div><label>Empresa</label><select id="cEmpresa"><option value="">Todas</option><option value="MVA">MVA</option><option value="EH">EH</option></select></div>
+<div><label>Ano</label><select id="cAno"><option value="">Todos</option><option value="2025">2025</option><option value="2026">2026</option></select></div>
+<div class="search-wide"><label>Busca</label><input id="cQuery" type="text" placeholder="Fornecedor ou documento"/></div>
+<div><label>Limite</label><input id="cLimit" type="number" min="10" max="5000" value="1000"/></div>
+<div><label class="cb"><input id="cIncludeOk" type="checkbox" checked/><span>Incluir OK</span></label></div>
+<div style="display:flex;align-items:end"><button onclick="startConference()">Gerar conferência</button></div>
+</div>
+<div id="cStatus" class="muted" style="margin-top:8px">Nenhuma conferência iniciada</div>
+<div class="table-wrap" style="margin-top:10px">
+<table class="hist-table">
+<thead><tr><th>Status</th><th>Empresa</th><th>Documento</th><th>Fornecedor</th><th>Esperado</th><th>Lançado</th><th>Detalhes</th></tr></thead>
+<tbody id="cBody"><tr><td colspan="7">Sem dados</td></tr></tbody>
+</table>
+</div>
+</section>
+</div>
+<div id="tabPra" class="c tab-panel hidden">
+<section class="card"><h3>Prazos em aberto</h3>
+<div class="hist-filters">
+<div><label>Empresa</label><select id="pEmpresa"><option value="">Todas</option><option value="MVA">MVA</option><option value="EH">EH</option></select></div>
+<div><label>Situação</label><select id="pStatus"><option value="">Todas</option><option value="vencido">Vencidos</option><option value="hoje">Hoje</option><option value="a_vencer">A vencer</option><option value="sem_data">Sem data</option></select></div>
+<div><label>Dias à frente</label><input id="pDays" type="number" min="0" max="365" value="30"/></div>
+<div class="search-wide"><label>Busca</label><input id="pQuery" type="text" placeholder="Fornecedor ou documento"/></div>
+<div><label>Limite</label><input id="pLimit" type="number" min="10" max="5000" value="500"/></div>
+<div style="display:flex;align-items:end"><button onclick="loadPrazos()">Buscar prazos</button></div>
+</div>
+<div class="table-wrap" style="margin-top:10px">
+<table class="hist-table">
+<thead><tr><th>Situação</th><th>Vencimento</th><th>Empresa</th><th>Documento</th><th>Fornecedor</th><th>Parcela</th><th>Valor</th></tr></thead>
+<tbody id="pBody"><tr><td colspan="7">Sem dados</td></tr></tbody>
 </table>
 </div>
 </section>
@@ -1488,7 +2010,7 @@ pre{margin:6px 0 0;background:#fff7ef;border:1px dashed #cf9f78;padding:8px;bord
 <div><label>Data inicial</label><input id="aFrom" type="date"/></div>
 <div><label>Data final</label><input id="aTo" type="date"/></div>
 <div><label>Usuário</label><input id="aUser" type="text" placeholder="Exemplo: dev"/></div>
-<div><label>Ação</label><select id="aAction"><option value="">Todas</option><option value="configuracao_salvar">Configurações</option><option value="senha_propria_alterar">Senha própria</option><option value="senha_usuario_redefinir">Senha de usuário</option><option value="usuario_criar">Criar usuário</option><option value="usuario_remover">Remover usuário</option><option value="reautenticar_gmail">Reautenticação</option><option value="reprocessar_emails">Reprocessar e-mails</option><option value="execucao_manual_iniciar">Executar agora</option><option value="execucao_manual_parar">Parar execução</option></select></div>
+<div><label>Ação</label><select id="aAction"><option value="">Todas</option><option value="configuracao_salvar">Configurações</option><option value="senha_propria_alterar">Senha própria</option><option value="senha_usuario_redefinir">Senha de usuário</option><option value="usuario_criar">Criar usuário</option><option value="usuario_remover">Remover usuário</option><option value="reautenticar_gmail">Reautenticação</option><option value="reprocessar_emails">Reprocessar e-mails</option><option value="recuperar_emails">Recuperar e-mails</option><option value="conferencia_parcelas">Conferência</option><option value="execucao_manual_iniciar">Executar agora</option><option value="execucao_manual_parar">Parar execução</option></select></div>
 <div class="search-wide"><label>Busca</label><input id="aQuery" type="text" placeholder="Usuário, ação, alvo, detalhes"/></div>
 <div><label>Limite</label><input id="aLimit" type="number" min="10" max="2000" value="300"/></div>
 <div style="display:flex;align-items:end"><button onclick="loadAudit()">Aplicar filtros</button></div>
@@ -1505,7 +2027,18 @@ pre{margin:6px 0 0;background:#fff7ef;border:1px dashed #cf9f78;padding:8px;bord
 </main>
 <script>
 const tech=document.getElementById('tech');
-function switchTab(tab){const main=document.getElementById('tabMain');const hist=document.getElementById('tabHist');const reg=document.getElementById('tabReg');const diag=document.getElementById('tabDiag');const bMain=document.getElementById('tabBtnMain');const bHist=document.getElementById('tabBtnHist');const bReg=document.getElementById('tabBtnReg');const bDiag=document.getElementById('tabBtnDiag');if(tab==='reg'&&!_authCtx.can_view_audit){tab='main';}main.classList.add('hidden');hist.classList.add('hidden');reg.classList.add('hidden');diag.classList.add('hidden');bMain.classList.remove('active');bHist.classList.remove('active');bReg.classList.remove('active');bDiag.classList.remove('active');if(tab==='diag'){diag.classList.remove('hidden');bDiag.classList.add('active');}else if(tab==='hist'){hist.classList.remove('hidden');bHist.classList.add('active');}else if(tab==='reg'){reg.classList.remove('hidden');bReg.classList.add('active');loadAudit(true);}else{main.classList.remove('hidden');bMain.classList.add('active');}}
+function switchTab(tab){
+  const panels={main:'tabMain',hist:'tabHist',conf:'tabConf',pra:'tabPra',reg:'tabReg',diag:'tabDiag'};
+  const btns={main:'tabBtnMain',hist:'tabBtnHist',conf:'tabBtnConf',pra:'tabBtnPra',reg:'tabBtnReg',diag:'tabBtnDiag'};
+  if(tab==='reg'&&!_authCtx.can_view_audit)tab='main';
+  Object.values(panels).forEach(id=>document.getElementById(id)?.classList.add('hidden'));
+  Object.values(btns).forEach(id=>document.getElementById(id)?.classList.remove('active'));
+  document.getElementById(panels[tab]||panels.main)?.classList.remove('hidden');
+  document.getElementById(btns[tab]||btns.main)?.classList.add('active');
+  if(tab==='reg')loadAudit(true);
+  if(tab==='pra')loadPrazos(true);
+  if(tab==='conf')pollConference(true);
+}
 const fmt=(s)=>{
   s=Math.max(0,Number(s||0));
   const h=Math.floor(s/3600);
@@ -1564,11 +2097,13 @@ function _updatePwdReqUi(){
   return r;
 }
 function _setPanelWriteAccess(canWrite){
-  const fields=['mode','maxPages','pageSize','intervalMin','account','days','limit','unread'];
+  const fields=['mode','maxPages','pageSize','intervalMin','account','days','limit','unread','recoverDocs','recoverFrom','recoverTo','cEmpresa','cAno','cQuery','cLimit','cIncludeOk'];
   fields.forEach(id=>{const el=document.getElementById(id);if(el)el.disabled=!canWrite;});
   const btnSelectors=[
     'button[onclick="saveSettings()"]',
     'button[onclick="reprocess()"]',
+    'button[onclick="recoverEmails()"]',
+    'button[onclick="startConference()"]',
     'button[onclick="runNow()"]',
     'button[onclick="stopRunNow()"]',
     'button[onclick="reauth(\\'principal\\')"]',
@@ -1643,7 +2178,7 @@ function _bindExpanders(){
     });
   });
 }
-function syncManualButtons(man){const runBtn=document.getElementById('runNowBtn');const stopBtn=document.getElementById('stopNowBtn');if(!runBtn||!stopBtn)return;const running=Boolean(man&&man.running&&man.account);const stopping=Boolean(man&&man.cancel_requested);const canOp=Boolean(_authCtx&&_authCtx.can_operate);if(!canOp){runBtn.disabled=true;stopBtn.disabled=true;stopBtn.classList.remove('stop-btn-active');stopBtn.classList.add('stop-btn-locked');stopBtn.setAttribute('aria-disabled','true');stopBtn.textContent='Parar';return;}runBtn.disabled=running;stopBtn.disabled=!running;stopBtn.classList.toggle('stop-btn-active',running);stopBtn.classList.toggle('stop-btn-locked',!running);stopBtn.setAttribute('aria-disabled',(!running)?'true':'false');stopBtn.textContent=stopping?'Parando':'Parar';}
+function syncManualButtons(man){const runBtn=document.getElementById('runNowBtn');const stopBtn=document.getElementById('stopNowBtn');if(!runBtn||!stopBtn)return;const running=Boolean(man&&man.running&&man.account);const stopping=Boolean(man&&man.cancel_requested);const canOp=Boolean(_authCtx&&_authCtx.can_operate);const actionBtns=['button[onclick="reprocess()"]','button[onclick="recoverEmails()"]'];if(!canOp){runBtn.disabled=true;stopBtn.disabled=true;actionBtns.forEach(sel=>document.querySelectorAll(sel).forEach(b=>b.disabled=true));stopBtn.classList.remove('stop-btn-active');stopBtn.classList.add('stop-btn-locked');stopBtn.setAttribute('aria-disabled','true');stopBtn.textContent='Parar';return;}runBtn.disabled=running;actionBtns.forEach(sel=>document.querySelectorAll(sel).forEach(b=>b.disabled=running));stopBtn.disabled=!running;stopBtn.classList.toggle('stop-btn-active',running);stopBtn.classList.toggle('stop-btn-locked',!running);stopBtn.setAttribute('aria-disabled',(!running)?'true':'false');stopBtn.textContent=stopping?'Parando':'Parar';}
 function upd(prefix,state,con){const st=(state&&state.status)||'waiting';const det=(state&&(state.friendly_detail||state.detail))||'Aguardando';const mail=(con&&con.email)||'-';if(prefix==='P'){pill('pillP',st);document.getElementById('mailP').textContent=`E-mail conectado: ${mail}`;document.getElementById('detP').textContent=det;document.getElementById('probP').textContent='';}else{pill('pillN',st);document.getElementById('mailN').textContent=`E-mail conectado: ${mail}`;document.getElementById('detN').textContent=det;document.getElementById('probN').textContent='';}}
 function report(r){const t=(r&&r.totals)||{};document.getElementById('kp1').textContent=t.processados||0;document.getElementById('kp2').textContent=t.ignorados||0;document.getElementById('kp3').textContent=t.avisos_ciclo||0;document.getElementById('kp4').textContent=t.avisos_dia||0;if(!r||!r.exists){document.getElementById('rmeta').textContent='Sem relatório encontrado ainda';}else{const w=r.updated_at?new Date(r.updated_at).toLocaleString('pt-BR'):'-';document.getElementById('rmeta').textContent=`Atualizado em: ${w} | Arquivo: ${r.path}`;}fill('lp',r.processados);fill('li',r.ignorados);fill('la',(r.avisos||[]).map(maskXml));}
 function _fmtDateTime(v){if(!v)return '-';try{return new Date(v).toLocaleString('pt-BR');}catch(_){return String(v);}}
@@ -1669,7 +2204,9 @@ function _sortHist(items){const k=_histSort.key;const dir=_histSort.dir==='asc'?
 function _renderHistory(items){_histItems=Array.isArray(items)?items:[];const body=document.getElementById('hBody');body.innerHTML='';let arr=_histItems.filter(it=>it.type==='boleto_lancado');arr=arr.map(it=>{const doc=`${it.doc_tipo||'-'} ${it.numero||''}`.trim();const fornec=_shortName(it.fornecedor||'-');const dest=_mapDestLabel(it);const local=_fmtLocal(it.local_lancamento);const detalhe=`Venc: ${it.vencimento||'-'} | ${it.parcela||'-'}`;return {...it,_doc:doc,_fornecedor:fornec,_dest:dest,_local:local,_detalhe:detalhe};});if(!arr.length){body.innerHTML='<tr><td colspan="7">Sem dados para os filtros selecionados</td></tr>';return;}arr=_sortHist(arr);arr.forEach(it=>{const tr=document.createElement('tr');const conta=it.conta||'-';const emit=String(it.cnpj_emit||'-');const menu=`<div class=\"cell-menu\"><button class=\"cell-btn\" onclick=\"_toggleMenu(event,this)\">${_esc(it._fornecedor)}</button><div class=\"cell-pop\"><button data-cnpj=\"${_esc(emit)}\" onclick=\"_showCnpj(event,this)\">Copiar CNPJ emitente</button></div></div>`;tr.innerHTML=`<td>${_fmtDateTime(it.at)}</td><td>${conta}</td><td>${it._doc}</td><td>${menu}</td><td>${it._dest}</td><td>${it._local}</td><td>${it._detalhe}</td>`;body.appendChild(tr);});}
 function _setSort(key){const ths=document.querySelectorAll('.hist-table th.sortable');ths.forEach(th=>{th.classList.remove('asc');th.classList.remove('desc');});if(_histSort.key===key){_histSort.dir=_histSort.dir==='asc'?'desc':'asc';}else{_histSort.key=key;_histSort.dir='asc';}const th=document.querySelector(`.hist-table th.sortable[data-key="${key}"]`);if(th)th.classList.add(_histSort.dir);_renderHistory(_histItems);} 
 document.querySelectorAll('.hist-table th.sortable').forEach(th=>{th.addEventListener('click',()=>_setSort(th.dataset.key));});
-async function loadHistory(silent=false){if(!silent)showToast('Buscando histórico');const p=new URLSearchParams();const vFrom=document.getElementById('hFrom').value||'';const vTo=document.getElementById('hTo').value||'';const vEmit=(document.getElementById('hEmit').value||'').trim();const vDest=(document.getElementById('hDest').value||'').trim();const vQuery=(document.getElementById('hQuery').value||'').trim();const vLimit=Number(document.getElementById('hLimit').value||300);if(vFrom)p.set('from',vFrom);if(vTo)p.set('to',vTo);if(vEmit)p.set('cnpj_emit',vEmit);if(vDest)p.set('cnpj_dest',vDest);if(vQuery)p.set('q',vQuery);p.set('limit',String(Math.max(10,Math.min(2000,vLimit||300))));const {j}=await api(`/api/history?${p.toString()}`);const items=j.items||[];_renderHistory(items);if(!silent)showToast(items.length?`Resultado: ${items.length} registro(s)`:'Nenhum resultado para os filtros selecionados');}
+function _historyParams(){const p=new URLSearchParams();const vFrom=document.getElementById('hFrom').value||'';const vTo=document.getElementById('hTo').value||'';const vEmit=(document.getElementById('hEmit').value||'').trim();const vDest=(document.getElementById('hDest').value||'').trim();const vConta=document.getElementById('hConta')?.value||'';const vTipo=document.getElementById('hTipo')?.value||'';const vEmpresa=document.getElementById('hEmpresa')?.value||'';const vQuery=(document.getElementById('hQuery').value||'').trim();const vLimit=Number(document.getElementById('hLimit').value||300);if(vFrom)p.set('from',vFrom);if(vTo)p.set('to',vTo);if(vEmit)p.set('cnpj_emit',vEmit);if(vDest)p.set('cnpj_dest',vDest);if(vConta)p.set('conta',vConta);if(vTipo)p.set('doc_tipo',vTipo);if(vEmpresa)p.set('empresa',vEmpresa);if(vQuery)p.set('q',vQuery);p.set('limit',String(Math.max(10,Math.min(5000,vLimit||300))));return p;}
+async function loadHistory(silent=false){if(!silent)showToast('Buscando histórico');const p=_historyParams();const {j}=await api(`/api/history?${p.toString()}`);const items=j.items||[];_renderHistory(items);if(!silent)showToast(items.length?`Resultado: ${items.length} registro(s)`:'Nenhum resultado para os filtros selecionados');}
+function exportHistory(){const p=_historyParams();window.location.href=_url(`/api/history/export?${p.toString()}`);}
 function _fmtAuditAction(v){
   const s=String(v||'').trim().toLowerCase();
   const map={
@@ -1680,6 +2217,8 @@ function _fmtAuditAction(v){
     usuario_remover:'Remover usuário',
     reautenticar_gmail:'Reautenticação Gmail',
     reprocessar_emails:'Reprocessar e-mails',
+    recuperar_emails:'Recuperar e-mails',
+    conferencia_parcelas:'Conferência',
     execucao_manual_iniciar:'Executar agora',
     execucao_manual_parar:'Parar execução',
   };
@@ -1696,12 +2235,20 @@ async function adminCreateUser(){if(!_authCtx.can_manage_users){showToast('Apena
 async function adminDeleteUser(){if(!_authCtx.can_manage_users){showToast('Apenas dev');return;}const u=(document.getElementById('delUser').value||'').trim();if(!u){showToast('Selecione um usuário para remover');return;}const {j}=await api('/api/auth/delete-user',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});showToast(j.message||'Usuário removido');await state();}
 async function adminResetPassword(){if(!_authCtx.can_manage_users){showToast('Apenas dev');return;}const u=(document.getElementById('rstUser').value||'').trim();const p1=document.getElementById('rstPwd').value||'';const p2=document.getElementById('rstPwd2').value||'';if(!u||!p1){showToast('Selecione usuário e informe a nova senha');return;}if(p1!==p2){showToast('Confirmação de senha não confere');return;}const {j}=await api('/api/auth/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,new_password:p1})});showToast(j.message||'Senha redefinida');if(!j.ok)return;document.getElementById('rstPwd').value='';document.getElementById('rstPwd2').value='';await state();}
 async function reprocess(){const p={account:document.getElementById('account').value,days:Number(document.getElementById('days').value),max_messages:Number(document.getElementById('limit').value),mark_unread:document.getElementById('unread').checked};const {j}=await api('/api/reprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});box(j.friendly||'Reprocessamento concluído',j.ok?'info':'error');await diag();await state();}
+async function recoverEmails(){const docs=(document.getElementById('recoverDocs').value||'').trim();const p={account:document.getElementById('account').value,max_messages:Number(document.getElementById('limit').value)||200,date_from:document.getElementById('recoverFrom').value||'',date_to:document.getElementById('recoverTo').value||'',nf_list:docs};const {j}=await api('/api/recover-emails',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});showToast(j.message||'Recuperação iniciada');await diag();await state();}
+function _money(v){const n=Number(v||0);return n.toLocaleString('pt-BR',{style:'currency',currency:'BRL'});}
+async function loadPrazos(silent=false){if(!silent)showToast('Buscando prazos');const p=new URLSearchParams();const empresa=document.getElementById('pEmpresa')?.value||'';const status=document.getElementById('pStatus')?.value||'';const days=document.getElementById('pDays')?.value||'';const q=(document.getElementById('pQuery')?.value||'').trim();const limit=Number(document.getElementById('pLimit')?.value||500);if(empresa)p.set('empresa',empresa);if(status)p.set('status',status);if(days)p.set('days',days);if(q)p.set('q',q);p.set('limit',String(Math.max(10,Math.min(5000,limit||500))));const {j}=await api(`/api/prazos?${p.toString()}`);const body=document.getElementById('pBody');const items=j.items||[];body.innerHTML='';if(!items.length){body.innerHTML='<tr><td colspan="7">Sem prazos para os filtros selecionados</td></tr>';return;}items.forEach(it=>{const tr=document.createElement('tr');const doc=`${it.doc_tipo||'-'} ${it.documento||''}`.trim();const sit=it.situacao==='vencido'?'Vencido':(it.situacao==='hoje'?'Hoje':(it.situacao==='a_vencer'?'A vencer':'Sem data'));tr.innerHTML=`<td>${_esc(sit)}</td><td>${_esc(it.vencimento||'-')}</td><td>${_esc(it.empresa||'-')}</td><td>${_esc(doc)}</td><td>${_esc(_shortName(it.fornecedor||'-'))}</td><td>${_esc(it.parcela||'-')}</td><td>${_esc(_money(it.valor_parcela||it.valor_total||0))}</td>`;body.appendChild(tr);});if(!silent)showToast(`Resultado: ${items.length} título(s)`);}
+async function startConference(){const p={empresa:document.getElementById('cEmpresa').value||'',ano:document.getElementById('cAno').value||'',q:(document.getElementById('cQuery').value||'').trim(),include_ok:document.getElementById('cIncludeOk').checked,limit:Number(document.getElementById('cLimit').value||1000)};const {j}=await api('/api/conferencia-parcelas/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});showToast(j.message||'Conferência iniciada');await pollConference(true);}
+function _renderConference(job){const body=document.getElementById('cBody');const st=document.getElementById('cStatus');if(!body||!st)return;st.textContent=(job&&job.message)||'Nenhuma conferência iniciada';const items=(job&&job.result)||[];body.innerHTML='';if(!items.length){body.innerHTML='<tr><td colspan="7">Sem dados</td></tr>';return;}items.forEach(it=>{const tr=document.createElement('tr');const doc=`${it.doc_tipo||'-'} ${it.documento||''}`.trim();const det=[];if((it.faltando||[]).length)det.push(`faltando ${it.faltando.join(',')}`);if((it.duplicadas||[]).length)det.push(`duplicada ${it.duplicadas.join(',')}`);if((it.extras||[]).length)det.push(`extra ${it.extras.join(',')}`);tr.innerHTML=`<td>${_esc(it.status_label||'-')}</td><td>${_esc(it.empresa||'-')}</td><td>${_esc(doc)}</td><td>${_esc(_shortName(it.fornecedor||'-'))}</td><td>${_esc(it.esperado||0)}</td><td>${_esc(it.lancado||0)}</td><td>${_esc(det.join(' | ')||((it.abas||[]).join(', ')||'-'))}</td>`;body.appendChild(tr);});}
+async function pollConference(silent=false){const {j}=await api('/api/conferencia-parcelas/job');_renderConference(j);if(!silent&&j.message)showToast(j.message);}
 async function runNow(){const acc=document.getElementById('account').value;syncManualButtons({running:true,account:acc,cancel_requested:false});const p={account:acc};const {j}=await api('/api/run-now',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});if(!j.ok){showToast(j.message||'Não foi possível iniciar a execução manual');syncManualButtons({running:false,account:'',cancel_requested:false});}await state();await diag();}
 async function stopRunNow(){syncManualButtons({running:true,account:'manual',cancel_requested:true});const {j}=await api('/api/run-stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});showToast(j.message||'Solicitação de parada enviada');await state();await diag();}
 async function countdown(sec){const ov=document.getElementById('ov');const c=document.getElementById('cnt');let n=Number(sec||5);c.textContent=String(n);ov.classList.add('show');await new Promise((res)=>{const t=setInterval(()=>{n-=1;c.textContent=String(Math.max(n,0));if(n<=0){clearInterval(t);res();}},1000);});ov.classList.remove('show');}
 async function reauth(a){await countdown(5);const {j}=await api('/api/reauth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account:a})});box(j.friendly||j.message||'Reautenticação concluída',j.ok?'info':'error');await diag();await state();}
-document.querySelectorAll('#hFrom,#hTo,#hEmit,#hDest,#hQuery,#hLimit').forEach(el=>{el.addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();loadHistory();}});});
+document.querySelectorAll('#hFrom,#hTo,#hEmit,#hDest,#hConta,#hTipo,#hEmpresa,#hQuery,#hLimit').forEach(el=>{el.addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();loadHistory();}});});
 document.querySelectorAll('#aFrom,#aTo,#aUser,#aAction,#aQuery,#aLimit').forEach(el=>{el.addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();loadAudit();}});});
+document.querySelectorAll('#pQuery,#pDays,#pLimit').forEach(el=>{el.addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();loadPrazos();}});});
+document.querySelectorAll('#cQuery,#cLimit').forEach(el=>{el.addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();startConference();}});});
 function bindDigitsOnly(id,minV,maxV){
   const el=document.getElementById(id);
   if(!el)return;
@@ -1727,7 +2274,7 @@ if(_intervalInput){
   _intervalInput.addEventListener('keydown',_showIntervalHint);
   _intervalInput.addEventListener('blur',()=>{_intervalHintShown=false;});
 }
-state();diag();loadHistory(true);loadAudit(true);setInterval(state,2000);setInterval(diag,5000);setInterval(()=>loadHistory(true),15000);setInterval(()=>{if(_authCtx.can_view_audit)loadAudit(true);},15000);
+state();diag();loadHistory(true);loadAudit(true);setInterval(state,2000);setInterval(diag,5000);setInterval(()=>loadHistory(true),15000);setInterval(()=>pollConference(true),5000);setInterval(()=>{if(_authCtx.can_view_audit)loadAudit(true);},15000);
 </script></body></html>"""
 
 
