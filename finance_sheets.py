@@ -5,10 +5,10 @@ from datetime import date, datetime, timedelta
 import gspread
 
 from auth import apiCooldown
+from sheet_registry import SHEET_KEYS
 from sheets_utils import getPlanilha
 
 
-SHEET_KEYS = ("EH_2025", "EH_2026", "MVA_2025", "MVA_2026")
 IGNORED_STATUS = {"BAIXADO", "BAIXADA", "ESTORNADO", "ESTORNADA", "PAGO", "PAGA", "QUITADO", "QUITADA"}
 
 

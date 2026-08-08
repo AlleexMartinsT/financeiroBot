@@ -1999,7 +1999,7 @@ pre{margin:6px 0 0;background:#fff7ef;border:1px dashed #cf9f78;padding:8px;bord
 <section class="card"><h3>Conferência de parcelas</h3>
 <div class="hist-filters">
 <div><label>Empresa</label><select id="cEmpresa"><option value="">Todas</option><option value="MVA">MVA</option><option value="EH">EH</option></select></div>
-<div><label>Ano</label><select id="cAno"><option value="">Todos</option><option value="2025">2025</option><option value="2026">2026</option></select></div>
+<div><label>Ano</label><select id="cAno"><option value="">Todos</option><option value="2025">2025</option><option value="2026">2026</option><option value="2027">2027</option></select></div>
 <div class="search-wide"><label>Busca</label><input id="cQuery" type="text" placeholder="Fornecedor ou documento"/></div>
 <div><label>Limite</label><input id="cLimit" type="number" min="10" max="5000" value="1000"/></div>
 <div><label class="cb"><input id="cIncludeOk" type="checkbox" checked/><span>Incluir OK</span></label></div>

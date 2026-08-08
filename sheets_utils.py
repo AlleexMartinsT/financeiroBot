@@ -1,8 +1,6 @@
 # sheets_utils.py
 import gspread
-from config import (
-    SHEET_EH_2025, SHEET_EH_2026, SHEET_MVA_2025, SHEET_MVA_2026,
-)
+from config import SHEET_IDS
 from auth import sheetsClient, apiCooldown
 
 planilhasCache = {}
@@ -11,15 +9,9 @@ def getPlanilha(chave):
     """Retorna objeto da planilha (gspread) a partir da chave lógica."""
     if chave in planilhasCache:
         return planilhasCache[chave]
-    planilhasID = {
-        "EH_2025": SHEET_EH_2025,
-        "EH_2026": SHEET_EH_2026,
-        "MVA_2025": SHEET_MVA_2025,
-        "MVA_2026": SHEET_MVA_2026
-    }
     for _ in range(3):
         try:
-            planilha = sheetsClient.open_by_key(planilhasID[chave])
+            planilha = sheetsClient.open_by_key(SHEET_IDS[chave])
             planilhasCache[chave] = planilha
             return planilha
         except gspread.exceptions.APIError as e:

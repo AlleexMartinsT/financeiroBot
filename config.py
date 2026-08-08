@@ -5,6 +5,8 @@ import json
 import shutil
 from pathlib import Path
 
+from sheet_registry import sheet_ids_from_config
+
 APP_NAME = "FinanceBot"
 APPDATA_BASE = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming")) / APP_NAME
 SECRETS_APPDATA_DIR = APPDATA_BASE / "secrets"
@@ -97,10 +99,13 @@ SCOPES_SHEET = [
 ]
 
 # === IDs das planilhas ===
-SHEET_EH_2025 = CONFIG_PRIV["planilhas"]["EH_2025"]
-SHEET_EH_2026 = CONFIG_PRIV["planilhas"]["EH_2026"]
-SHEET_MVA_2025 = CONFIG_PRIV["planilhas"]["MVA_2025"]
-SHEET_MVA_2026 = CONFIG_PRIV["planilhas"]["MVA_2026"]
+SHEET_IDS = sheet_ids_from_config(CONFIG_PRIV["planilhas"])
+SHEET_EH_2025 = SHEET_IDS["EH_2025"]
+SHEET_EH_2026 = SHEET_IDS["EH_2026"]
+SHEET_EH_2027 = SHEET_IDS["EH_2027"]
+SHEET_MVA_2025 = SHEET_IDS["MVA_2025"]
+SHEET_MVA_2026 = SHEET_IDS["MVA_2026"]
+SHEET_MVA_2027 = SHEET_IDS["MVA_2027"]
 
 # === CNPJs ===
 CNPJ_EH = CONFIG_PRIV["cnpjs"]["EH"]
