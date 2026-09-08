@@ -22,3 +22,20 @@ class MainLoopRecoveryTests(unittest.TestCase):
         report_failure.assert_called_once()
         self.assertEqual("falha inesperada", str(report_failure.call_args.args[0]))
         wait_for_retry.assert_called_once_with(60)
+
+    def test_retries_even_when_recording_the_failure_is_not_possible(self):
+        execute_loop = Mock(side_effect=OSError("No space left on device"))
+        report_failure = Mock(side_effect=OSError("No space left on device"))
+        wait_for_retry = Mock(return_value=True)
+
+        run_with_recovery(
+            execute_loop=execute_loop,
+            should_stop=lambda: False,
+            wait_for_retry=wait_for_retry,
+            report_failure=report_failure,
+            retry_seconds=60,
+        )
+
+        execute_loop.assert_called_once()
+        report_failure.assert_called_once()
+        wait_for_retry.assert_called_once_with(60)

@@ -9,7 +9,10 @@ def run_with_recovery(
         try:
             execute_loop()
         except Exception as exc:
-            report_failure(exc)
+            try:
+                report_failure(exc)
+            except Exception:
+                pass
             if wait_for_retry(retry_seconds):
                 break
         else:
