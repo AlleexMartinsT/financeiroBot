@@ -11,6 +11,7 @@ from gmail_fetcher import processarEmails
 from panel_web import start_control_panel
 import runtime_status
 from auto_updater import AutoUpdater
+from loop_supervisor import run_with_recovery
 from reporter import (
     eventosProcessados,
     eventosIgnorados,
@@ -99,9 +100,7 @@ def _check_and_restart_if_update():
         _restart_process("Atualizacao aplicada")
 
 
-def main_loop():
-    global running
-    running = True
+def _executar_loop_principal():
     print("[Loop] Iniciando verificação automatica.")
     limpar_xmls_baixados()
     runtime_status.set_account_status("principal", "waiting", "Aguardando ciclo.")
@@ -214,8 +213,31 @@ def main_loop():
                 break
             time.sleep(1)
             remaining -= 1
-    running = False
-    print("[Loop] Encerrado.")
+
+
+def _registrar_falha_inesperada(exc: Exception):
+    hora_atual = datetime.now().strftime("%H:%M - %d/%m/%Y")
+    mensagem = f"[{hora_atual}] Erro inesperado no loop automatico: {exc}"
+    runtime_status.set_account_status("principal", "error", mensagem)
+    runtime_status.set_account_status("nfe", "error", mensagem)
+    print(f"[Loop] {mensagem}")
+    escreverRelatorio(mensagem)
+    escreverRelatorio("O FinanceBot tentara novamente em 1 minuto.")
+
+
+def main_loop():
+    global running
+    running = True
+    try:
+        run_with_recovery(
+            execute_loop=_executar_loop_principal,
+            should_stop=stop_event.is_set,
+            wait_for_retry=stop_event.wait,
+            report_failure=_registrar_falha_inesperada,
+        )
+    finally:
+        running = False
+        print("[Loop] Encerrado.")
 
 
 def iniciar_verificacao():
